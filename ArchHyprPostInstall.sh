@@ -746,6 +746,19 @@ setup_firewall() {
     #sudo ufw allow 6881/tcp comment "Deluge TCP"
     #sudo ufw allow 6881/udp comment "Deluge UDP"
 
+    # libvirt/KVM virtual networking. With "deny incoming" + "deny forward",
+    # ufw otherwise drops guest DHCP requests to dnsmasq (no IP lease) and the
+    # NAT forwarding (no internet in guests). These rules let the default
+    # network (virbr0) work. Guarded so it's a no-op when libvirt isn't set up.
+    if ip link show virbr0 &>/dev/null; then
+        sudo ufw allow in on virbr0        comment "libvirt DHCP/DNS"
+        sudo ufw route allow in on virbr0  comment "libvirt NAT in"
+        sudo ufw route allow out on virbr0 comment "libvirt NAT out"
+        log "Added libvirt virbr0 firewall rules (VM networking)."
+    else
+        log "virbr0 not present — skipping libvirt firewall rules."
+    fi
+
     service_enabled ufw \
         || sudo systemctl enable ufw \
         || warn "Could not enable the UFW service — continuing."
