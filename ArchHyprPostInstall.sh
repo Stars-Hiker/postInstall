@@ -177,6 +177,27 @@ When = PostTransaction
 Exec = /bin/bash -c 'orphans=$(pacman -Qdtq 2>/dev/null); [ -n "$orphans" ] && echo "WARNING: Orphaned packages found: $orphans" || true'
 EOF
 
+    # Auto-refresh the dotfiles package lists after every transaction so
+    # pkglists/pkgs-{native,aur}.txt always reflect reality. The generator runs
+    # as root (hooks always do) and chowns the files back to the repo owner.
+    # The [ -d ] guard makes it a no-op on a machine where the dotfiles repo
+    # isn't cloned yet (e.g. mid-bootstrap). Absolute path is required: hooks
+    # have no $HOME and no working directory guarantees.
+    local snapshot="${DOTFILES_DIR}/bin/pkg-snapshot.sh"
+    sudo tee /etc/pacman.d/hooks/95-pkglist-snapshot.hook > /dev/null <<EOF
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = Snapshotting explicit package lists to dotfiles...
+When = PostTransaction
+Exec = /bin/bash -c '[ -x "${snapshot}" ] && "${snapshot}" || true'
+EOF
+
     success "pacman hooks installed."
 }
 
@@ -317,45 +338,84 @@ EOF
 # ==============================================================================
 
 install_essentials() {
-    section "Installing essential packages"
+    section "Installing bootstrap packages"
 
-    # NOTE: git, curl, wget, vim, neovim, zip, unzip, btrfs-progs, e2fsprogs,
-    # xfsprogs, ntfs-3g are also installed by ArchWizard. Using --needed ensures
-    # pacman skips them silently when already present.
+    # MINIMAL bootstrap set — just enough to clone the dotfiles repo, stow it,
+    # decrypt secrets, and then let install_from_pkglists() pull EVERYTHING else
+    # from dotfiles/pkglists/. The full curated package set is no longer hardcoded
+    # here; the package lists in the dotfiles repo are the single source of truth.
+    #   git/curl  → clone the repo
+    #   stow      → deploy the configs
+    #   base-devel→ makepkg deps (also pulled by install_paru, kept for safety)
+    #   openssh   → ssh client/agent (keys restored by restore_secrets)
+    #   age       → decrypt secrets/secrets.tar.age
     local pkgs=(
-        # Version control & network fetch
-        git curl stow
-
-        # Remote access & file transfer
-        openssh rsync
-
-        # Editors
-        neovim
-
-        # Shell
-        zsh
-
-        # Terminal multiplexer
-        tmux
-
-        # Man pages
-        man-db man-pages
-
-        # Filesystem tools — covers every common FS you'll encounter
-        btrfs-progs     # Btrfs
-        dosfstools      # FAT/FAT32
-        exfatprogs      # exFAT
-        e2fsprogs       # ext2/3/4
-        ntfs-3g         # NTFS (read-write)
-        xfsprogs        # XFS
-        udftools        # UDF (optical discs, some USB sticks)
+        git curl stow base-devel openssh age
     )
-    # NOTE: gzip and bzip2 are intentionally omitted — they ship with every
-    # Arch base install as dependencies of core packages.
 
     sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
-        || error_exit "Failed to install essential packages."
-    success "Essentials installed."
+        || error_exit "Failed to install bootstrap packages."
+    success "Bootstrap packages installed."
+}
+
+# Install the FULL package set from the dotfiles repo's lists. This runs AFTER
+# deploy_dotfiles() so $DOTFILES_DIR/pkglists/ exists. These two files are the
+# single source of truth for "what is installed on this machine" and are kept
+# fresh automatically by the pacman hook (setup_pacman_hooks) + `dotsync`.
+install_from_pkglists() {
+    section "Installing packages from dotfiles lists"
+
+    local native="$DOTFILES_DIR/pkglists/pkgs-native.txt"
+    local aur="$DOTFILES_DIR/pkglists/pkgs-aur.txt"
+
+    if file_exists "$native"; then
+        log "Installing native (repo) packages from $native ..."
+        sudo pacman -S --needed --noconfirm - < "$native" \
+            || error_exit "Failed to install native packages from list."
+        success "Native packages installed."
+    else
+        warn "No native package list at $native — skipping."
+    fi
+
+    if file_exists "$aur"; then
+        if cmd_exists paru; then
+            log "Installing AUR/foreign packages from $aur ..."
+            paru -S --needed --noconfirm - < "$aur" \
+                || warn "Some AUR packages failed to install — review output above."
+            success "AUR packages installed."
+        else
+            warn "paru not found — skipping AUR list: $aur"
+        fi
+    else
+        warn "No AUR package list at $aur — skipping."
+    fi
+}
+
+# Restore encrypted secrets (~/.ssh etc.) from the dotfiles repo.
+# Requires the PRIVATE age identity at ~/.config/age/keys.txt, which is NEVER in
+# git — restore it from Bitwarden/USB first. If absent, warn and continue so the
+# rest of the bootstrap still completes.
+restore_secrets() {
+    section "Restoring encrypted secrets"
+
+    local unseal="$DOTFILES_DIR/bin/secrets-unseal.sh"
+    local identity="$HOME/.config/age/keys.txt"
+
+    if ! file_exists "$unseal"; then
+        warn "No unseal script at $unseal — skipping secrets restore."
+        return 0
+    fi
+
+    if file_exists "$identity"; then
+        log "Age identity found — decrypting secrets..."
+        bash "$unseal" \
+            || warn "secrets-unseal.sh failed — restore your secrets manually."
+        success "Secrets restored."
+    else
+        warn "No age identity at $identity — secrets NOT restored."
+        warn "  Copy your age key from Bitwarden/USB to $identity, then run:"
+        warn "    $unseal"
+    fi
 }
 
 install_custom_tools() {
@@ -429,33 +489,19 @@ install_custom_tools() {
     success "Custom tools installed."
 }
 
-install_qemu_kvm() {
-    section "Installing QEMU/KVM virtualisation stack"
+configure_qemu_kvm() {
+    section "Configuring QEMU/KVM virtualisation stack"
 
-    local pkgs=(
-        qemu-full           # Full QEMU with all architecture targets
-        # qemu-img is included in qemu-full; not listed separately
-        libvirt             # Virtualisation API daemon
-        virt-install        # CLI VM provisioner
-        virt-manager        # GUI front-end for libvirt
-        virt-viewer         # SPICE/VNC display client
-        edk2-ovmf           # UEFI firmware for VMs
-        swtpm               # Software TPM 2.0 emulator (required for Windows 11 VMs)
-        guestfs-tools       # Inspect/modify VM disk images offline
-        libosinfo           # OS metadata DB used by virt-manager
-        dnsmasq             # Required by libvirt's default NAT network
-        #bridge-utils        # Required for bridged (non-NAT) networking REMOVED FROM DEPOT
-        openbsd-netcat      # Used internally by some libvirt operations
-        # NOTE: tuned intentionally NOT listed here — it is a power management
-        # tool, not a virtualisation dependency. Installing it here caused
-        # systemd presets to auto-enable it on some systems, creating a
-        # conflict with TLP when MACHINE_TYPE=laptop.
-        # tuned is installed exclusively by install_power_management() when
-        # MACHINE_TYPE=desktop, where it is needed and there is no conflict.
-    )
+    # NOTE: the QEMU/KVM PACKAGES (qemu-full, libvirt, virt-manager, swtpm,
+    # edk2-ovmf, guestfs-tools, dnsmasq, …) are now installed from the dotfiles
+    # package lists by install_from_pkglists(). This function only handles the
+    # service/group/network setup that the lists can't capture. It runs after
+    # install_from_pkglists(), so the binaries are already present.
 
-    sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
-        || error_exit "Failed to install QEMU/KVM packages."
+    if ! cmd_exists virsh; then
+        warn "libvirt not installed (not in pkglists?) — skipping KVM config."
+        return 0
+    fi
 
     # Enable libvirt daemon — but do NOT enable tuned here.
     # tuned is managed exclusively in install_power_management() so the
@@ -1137,21 +1183,32 @@ check_dependencies
 # Pacman config first — all subsequent installs benefit from ParallelDownloads
 # and the multilib repo being available.
 #configure_pacman
-#setup_pacman_hooks
+setup_pacman_hooks      # incl. the pkglist-snapshot hook (keeps lists fresh)
 
 # Mirrors
 #setup_mirrors
 #setup_mirror_timer
 
-# AUR helper
+# AUR helper (needed before install_from_pkglists for the AUR list)
 install_paru
 configure_paru
 
-# Packages
+# Bootstrap: minimal toolchain to fetch the dotfiles repo + decrypt secrets.
 install_essentials
 install_fonts           # moved early — no ordering dep, slow to download
-install_custom_tools
-install_qemu_kvm
+
+# Bring the source of truth onto the machine, THEN install everything from it.
+deploy_dotfiles         # clone dotfiles repo + stow configs (runs install.sh)
+install_from_pkglists   # install the FULL package set from pkglists/*
+restore_secrets         # decrypt ~/.ssh etc. (if age key is present)
+
+# NOTE: install_custom_tools is intentionally NOT called — its curated package
+# list is now captured in dotfiles/pkglists/ and installed above. The function
+# is kept defined for reference only.
+
+# Virtualisation: packages came from the list above; this only does
+# service/group/network setup.
+configure_qemu_kvm
 
 # Shell
 install_zsh_plugins
@@ -1173,8 +1230,5 @@ harden_ssh
 
 # Hyprland + ecosysteme Wayland
 install_hyprland
-
-# Dotfiles Hyprland — fin du script
-#deploy_dotfiles
 
 print_summary
