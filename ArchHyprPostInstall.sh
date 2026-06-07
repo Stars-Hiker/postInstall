@@ -526,7 +526,8 @@ configure_qemu_kvm() {
     # install_from_pkglists(), so the binaries are already present.
 
     if ! cmd_exists virsh; then
-        warn "libvirt not installed (not in pkglists?) — skipping KVM config."
+        warn "libvirt/virsh not found — it likely failed to install (check the"
+        warn "install_from_pkglists failure summary above). Skipping KVM config."
         return 0
     fi
 
@@ -810,30 +811,37 @@ install_power_management() {
         sudo systemctl mask    tuned.service 2>/dev/null || true
         log "tuned masked — will not interfere with TLP."
 
-        pkg_installed tlp \
-            || sudo pacman -S --needed --noconfirm tlp tlp-rdw \
-            || error_exit "Failed to install TLP."
+        # Power management is a nice-to-have — NEVER abort the whole recovery if
+        # it fails (e.g. inside a VM there is no battery and TLP won't start).
+        if ! pkg_installed tlp; then
+            sudo pacman -S --needed --noconfirm tlp tlp-rdw \
+                || { warn "Could not install TLP — skipping power management."; return 0; }
+        fi
 
         # TLP manages radio kill switches directly — mask the systemd units
         # that would otherwise fight it.
-        sudo systemctl mask systemd-rfkill.service systemd-rfkill.socket
+        sudo systemctl mask systemd-rfkill.service systemd-rfkill.socket 2>/dev/null || true
 
-        service_enabled tlp.service \
-            || sudo systemctl enable --now tlp.service \
-            || error_exit "Failed to enable TLP."
-
-        success "TLP enabled for laptop power management."
+        if ! service_enabled tlp.service; then
+            sudo systemctl enable --now tlp.service \
+                && success "TLP enabled for laptop power management." \
+                || warn "Could not enable TLP (expected inside a VM — no battery). Continuing."
+        else
+            success "TLP already enabled."
+        fi
 
     else
         # Desktop mode: install and enable tuned with the "balanced" profile.
         # tuned is now installed here (not in install_qemu_kvm) so that it is
         # never present on laptop systems where it would conflict with TLP.
-        pkg_installed tuned \
-            || sudo pacman -S --needed --noconfirm tuned \
-            || error_exit "Failed to install tuned."
+        # Same principle: never fatal.
+        if ! pkg_installed tuned; then
+            sudo pacman -S --needed --noconfirm tuned \
+                || { warn "Could not install tuned — skipping power management."; return 0; }
+        fi
         service_enabled tuned.service \
             || sudo systemctl enable --now tuned.service \
-            || error_exit "Failed to enable tuned."
+            || warn "Could not enable tuned. Continuing."
 
         if cmd_exists tuned-adm; then
             sudo tuned-adm profile balanced \
@@ -841,7 +849,7 @@ install_power_management() {
             log "tuned profile set to 'balanced'."
         fi
 
-        success "tuned enabled for desktop power management."
+        success "Power management step done (tuned)."
     fi
 }
 
@@ -869,13 +877,17 @@ setup_snapper() {
 
     # NOTE: snapper et snap-pac sont aussi installes par ArchWizard si Btrfs
     # est detecte. --needed les ignore silencieusement s ils sont deja presents.
+    # Snapshots are a safety net, not a hard requirement — never abort recovery
+    # if this fails (e.g. an installer-made Btrfs layout snapper dislikes).
     sudo pacman -S --needed --noconfirm snapper snap-pac \
-        || error_exit "Failed to install snapper."
+        || { warn "Could not install snapper — skipping snapshot setup."; return 0; }
 
     # Create a snapper config for root if one doesn't exist yet.
     if ! sudo snapper list-configs | grep -q "^root "; then
         sudo snapper -c root create-config / \
-            || error_exit "Failed to create snapper root config."
+            || { warn "Could not create snapper root config (often a subvolume"; \
+                 warn "layout snapper rejects) — skipping. Configure manually later."; \
+                 return 0; }
         log "Snapper root config created."
     else
         log "Snapper root config already exists — skipping create-config."
