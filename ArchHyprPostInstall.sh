@@ -536,7 +536,7 @@ configure_qemu_kvm() {
     # laptop vs desktop logic stays in one place.
     service_enabled libvirtd.service \
         || sudo systemctl enable --now libvirtd.service \
-        || error_exit "Failed to enable libvirtd."
+        || warn "Could not enable libvirtd — continuing (VMs unavailable until fixed)."
 
     # Add user to required groups.
     # libvirt → manage VMs without sudo
@@ -544,8 +544,8 @@ configure_qemu_kvm() {
     for grp in libvirt kvm; do
         if ! id -nG "$USER" | grep -qw "$grp"; then
             sudo usermod -aG "$grp" "$USER" \
-                || error_exit "Failed to add $USER to group $grp."
-            log "Added '$USER' to group '$grp'."
+                && log "Added '$USER' to group '$grp'." \
+                || warn "Could not add $USER to group '$grp' — add it later: usermod -aG $grp $USER"
         else
             log "User '$USER' already in group '$grp'."
         fi
@@ -595,10 +595,11 @@ install_zsh_plugins() {
             log "Plugin '$name' already cloned — pulling latest..."
             git -C "$dest" pull --ff-only || warn "Could not update '$name' — skipping."
         else
-            git clone "$url" "$dest" || error_exit "Failed to clone '$name'."
+            git clone "$url" "$dest" \
+                || warn "Failed to clone '$name' — that plugin will be inactive. Continuing."
         fi
     done
-    success "ZSH plugins ready."
+    success "ZSH plugins step done."
 }
 
 configure_zsh() {
@@ -667,7 +668,8 @@ set_default_shell_zsh() {
     section "Setting ZSH as default shell"
 
     local zsh_path
-    zsh_path=$(command -v zsh) || error_exit "zsh not found in PATH."
+    zsh_path=$(command -v zsh) \
+        || { warn "zsh not found in PATH — leaving the default shell unchanged."; return 0; }
 
     if [[ "$SHELL" == "$zsh_path" ]]; then
         log "ZSH is already the default shell."
@@ -678,8 +680,9 @@ set_default_shell_zsh() {
     grep -qxF "$zsh_path" /etc/shells \
         || echo "$zsh_path" | sudo tee -a /etc/shells > /dev/null
 
-    chsh -s "$zsh_path" || error_exit "Failed to set ZSH as default shell."
-    success "Default shell set to ZSH. Re-login to apply."
+    chsh -s "$zsh_path" \
+        && success "Default shell set to ZSH. Re-login to apply." \
+        || warn "Could not set ZSH as default shell — change it later: chsh -s $zsh_path"
 }
 
 
@@ -698,7 +701,7 @@ install_fonts() {
         otf-font-awesome
     )
     sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
-        || error_exit "Failed to install fonts."
+        || { warn "Some fonts failed to install — continuing (icons/emoji may be missing)."; return 0; }
 
     # Rebuild font cache so new fonts are usable immediately without a reboot.
     fc-cache -fv &>/dev/null
@@ -718,7 +721,7 @@ setup_firewall() {
     # manquantes (--needed + check "Status: active" gerent l idempotence).
     pkg_installed ufw \
         || sudo pacman -S --needed --noconfirm ufw \
-        || error_exit "Failed to install UFW."
+        || { warn "Failed to install UFW — skipping firewall setup. Configure it later."; return 0; }
 
     # Only reset if UFW has never been configured (clean install).
     # Resetting on re-runs would silently destroy manually added rules.
@@ -745,11 +748,11 @@ setup_firewall() {
 
     service_enabled ufw \
         || sudo systemctl enable ufw \
-        || error_exit "Failed to enable UFW service."
+        || warn "Could not enable the UFW service — continuing."
 
-    sudo ufw --force enable || error_exit "Failed to activate UFW."
+    sudo ufw --force enable || warn "Could not activate UFW — continuing (firewall may be inactive)."
     sudo ufw status verbose | tee -a "$LOG_FILE"
-    success "Firewall configured."
+    success "Firewall step done."
 }
 
 harden_ssh() {
@@ -915,7 +918,9 @@ install_hyprland() {
     section "Installing Hyprland & Wayland ecosystem"
 
     if ! cmd_exists paru; then
-        error_exit "paru is required for this step but was not found. Run install_paru first."
+        warn "paru not found — cannot install the Hyprland packages. Skipping."
+        warn "Install paru, then re-run, or: paru -S hyprland waybar rofi kitty ..."
+        return 0
     fi
 
     # ── Core — Hyprland et ecosysteme natif Hypr ─────────────────────────────
@@ -986,9 +991,9 @@ install_hyprland() {
 
     log "Installing ${#all_pkgs[@]} Hyprland packages via paru..."
     paru -S --needed --noconfirm "${all_pkgs[@]}" \
-        || error_exit "paru failed to install Hyprland packages."
+        || warn "Some Hyprland packages failed to install (see paru output above) — continuing."
 
-    success "Hyprland ecosystem installed."
+    success "Hyprland ecosystem step done."
 
     # ── Plugin hyprexpo via hyprpm ────────────────────────────────────────────
     # hyprpm est installe avec hyprland. Il gere les plugins officiels.
