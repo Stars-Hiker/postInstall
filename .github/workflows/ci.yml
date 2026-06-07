@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Shell syntax + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: bash -n (parse check)
+        run: bash -n ArchHyprPostInstall.sh
+
+      # SC1090/SC1091: can't follow dynamic/non-constant source paths (runtime files).
+      # SC2155: "declare and assign separately" — stylistic, pervasive here by choice.
+      - name: shellcheck
+        run: shellcheck -e SC1090,SC1091,SC2155 ArchHyprPostInstall.sh

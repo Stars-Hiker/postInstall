@@ -368,26 +368,53 @@ install_from_pkglists() {
     local native="$DOTFILES_DIR/pkglists/pkgs-native.txt"
     local aur="$DOTFILES_DIR/pkglists/pkgs-aur.txt"
 
+    # Failures from BOTH lists accumulate here so we can report them once at the
+    # end. A package that was renamed or dropped from the repos (a routine event
+    # on rolling Arch) must NOT abort the whole recovery — we install everything
+    # that still resolves, then tell the user exactly what to look at by hand.
+    local -a failed=()
+
+    # install_pkg_list <installer-cmd...> -- reads package names (one per line,
+    # '#' comments and blanks ignored) from stdin and installs them one at a
+    # time, appending any that fail to the shared `failed` array.
+    install_pkg_list() {
+        local pkg
+        while IFS= read -r pkg; do
+            pkg="${pkg%%#*}"; pkg="${pkg// /}"   # strip comments + whitespace
+            [[ -n "$pkg" ]] || continue
+            if ! "$@" --needed --noconfirm "$pkg" >/dev/null 2>&1; then
+                warn "  ✗ failed: $pkg"
+                failed+=("$pkg")
+            fi
+        done
+    }
+
     if file_exists "$native"; then
-        log "Installing native (repo) packages from $native ..."
-        sudo pacman -S --needed --noconfirm - < "$native" \
-            || error_exit "Failed to install native packages from list."
-        success "Native packages installed."
+        log "Installing native (repo) packages one by one from $native ..."
+        install_pkg_list sudo pacman -S < "$native"
+        success "Native package pass complete."
     else
         warn "No native package list at $native — skipping."
     fi
 
     if file_exists "$aur"; then
         if cmd_exists paru; then
-            log "Installing AUR/foreign packages from $aur ..."
-            paru -S --needed --noconfirm - < "$aur" \
-                || warn "Some AUR packages failed to install — review output above."
-            success "AUR packages installed."
+            log "Installing AUR/foreign packages one by one from $aur ..."
+            install_pkg_list paru -S < "$aur"
+            success "AUR package pass complete."
         else
             warn "paru not found — skipping AUR list: $aur"
         fi
     else
         warn "No AUR package list at $aur — skipping."
+    fi
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        warn "${#failed[@]} package(s) could not be installed (renamed, dropped,"
+        warn "or temporarily unavailable). Install/replace these manually later:"
+        warn "  ${failed[*]}"
+    else
+        success "All packages from the lists installed."
     fi
 }
 
@@ -547,10 +574,14 @@ install_zsh_plugins() {
 
     # Format: "folder-name|clone-url"
     local plugins=(
+        "fzf-tab|https://github.com/Aloxaf/fzf-tab"
         "zsh-autosuggestions|https://github.com/zsh-users/zsh-autosuggestions"
         "zsh-syntax-highlighting|https://github.com/zsh-users/zsh-syntax-highlighting"
         "zsh-history-substring-search|https://github.com/zsh-users/zsh-history-substring-search"
     )
+    # fzf-tab: replaces zsh's plain completion menu with an fzf picker (with
+    # previews). The .zshrc _load's it from ~/AUR/fzf-tab — without this clone it
+    # silently vanishes on a fresh machine.
     # zsh-history-substring-search: type part of a past command, press Up/Down
     # to cycle through all history entries that match.
 
@@ -1182,7 +1213,7 @@ check_dependencies
 
 # Pacman config first — all subsequent installs benefit from ParallelDownloads
 # and the multilib repo being available.
-#configure_pacman
+configure_pacman        # Color, ParallelDownloads, VerbosePkgLists, multilib
 setup_pacman_hooks      # incl. the pkglist-snapshot hook (keeps lists fresh)
 
 # Mirrors
@@ -1220,10 +1251,10 @@ setup_firewall
 harden_ssh
 
 # Power
-#install_power_management
+install_power_management   # laptop → TLP (masks tuned); desktop → tuned
 
 # Snapshots (no-op if root is not Btrfs)
-#setup_snapper
+setup_snapper              # auto pre/post-pacman Btrfs snapshots via snap-pac
 
 # Editor
 #configure_neovim
