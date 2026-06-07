@@ -1119,9 +1119,28 @@ deploy_dotfiles() {
         # ── Tentative clone GitHub ────────────────────────────────────────────
         if curl -s --max-time 5 https://github.com > /dev/null 2>&1; then
             log "Cloning dotfiles from $DOTFILES_REPO ..."
-            git clone "$DOTFILES_REPO" "$DOTFILES_DIR" \
-                || error_exit "git clone failed."
-            success "Dotfiles cloned from GitHub."
+            # GIT_TERMINAL_PROMPT=0: on a fresh machine a PRIVATE repo would
+            # otherwise hang waiting for a username/password prompt — fail fast
+            # instead and explain what to do.
+            local clone_log
+            if clone_log="$(GIT_TERMINAL_PROMPT=0 git clone "$DOTFILES_REPO" "$DOTFILES_DIR" 2>&1)"; then
+                success "Dotfiles cloned from GitHub."
+            else
+                echo "$clone_log" | sed 's/^/    /'
+                warn "Could not clone $DOTFILES_REPO."
+                if echo "$clone_log" | grep -qiE 'authentication|could not read username|terminal prompts disabled|repository not found|403|access denied|permission denied'; then
+                    warn "This looks like an AUTH problem: the repo is likely PRIVATE and there"
+                    warn "is no GitHub credential on this fresh machine yet. Fix one way, then"
+                    warn "re-run this script (it reuses an existing $DOTFILES_DIR):"
+                    warn "  • Make the repo public — it's safe: secrets are age-encrypted."
+                    warn "  • Or authenticate:  install github-cli, run 'gh auth login', re-run."
+                    warn "  • Or clone it yourself to $DOTFILES_DIR, then re-run."
+                else
+                    warn "Check network/DNS and that $DOTFILES_REPO exists, then re-run."
+                fi
+                warn "  • Offline option: put a 'dotfiles-offline' copy on a USB key, then re-run."
+                error_exit "Dotfiles clone failed — see guidance above."
+            fi
 
         # ── Fallback : copie depuis clé USB ───────────────────────────────────
         else
