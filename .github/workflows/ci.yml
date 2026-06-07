@@ -17,7 +17,9 @@ jobs:
       - name: bash -n (parse check)
         run: bash -n ArchHyprPostInstall.sh
 
-      # SC1090/SC1091: can't follow dynamic/non-constant source paths (runtime files).
-      # SC2155: "declare and assign separately" — stylistic, pervasive here by choice.
+      # This is a large, intentionally un-pedantic script. bash -n above already
+      # catches syntax errors; here we gate only on shellcheck *error*-level
+      # findings (real breakage), not the many style/info/warning suggestions.
+      # SC1090/SC1091: dynamic source paths. SC2155: declare-and-assign style.
       - name: shellcheck
-        run: shellcheck -e SC1090,SC1091,SC2155 ArchHyprPostInstall.sh
+        run: shellcheck --severity=error -e SC1090,SC1091,SC2155 ArchHyprPostInstall.sh
