@@ -367,6 +367,11 @@ install_from_pkglists() {
 
     local native="$DOTFILES_DIR/pkglists/pkgs-native.txt"
     local aur="$DOTFILES_DIR/pkglists/pkgs-aur.txt"
+    # Curated AUR extras: packages we want from the AUR that the auto-snapshot
+    # can't capture as foreign (e.g. tools installed from a third-party repo like
+    # BlackArch on the source machine, so pacman -Qqem misses them). Not touched
+    # by pkg-snapshot.sh — edit by hand.
+    local aur_extra="$DOTFILES_DIR/pkglists/pkgs-aur-extra.txt"
     local -a failed=()
 
     # CRITICAL: read the lists into memory BEFORE installing anything. The
@@ -378,6 +383,7 @@ install_from_pkglists() {
     local -a native_pkgs=() aur_pkgs=()
     [[ -f "$native" ]] && mapfile -t native_pkgs < <(sed 's/#.*//' "$native" | tr -d '[:blank:]' | grep -v '^$')
     [[ -f "$aur"    ]] && mapfile -t aur_pkgs    < <(sed 's/#.*//' "$aur"    | tr -d '[:blank:]' | grep -v '^$')
+    [[ -f "$aur_extra" ]] && mapfile -t -O "${#aur_pkgs[@]}" aur_pkgs < <(sed 's/#.*//' "$aur_extra" | tr -d '[:blank:]' | grep -v '^$')
 
     # install_batch <installer...> : install the `batch` array in ONE transaction
     # (fast; fires the snapshot hook just once); if that fails (e.g. a renamed or
@@ -689,8 +695,10 @@ set_default_shell_zsh() {
     grep -qxF "$zsh_path" /etc/shells \
         || echo "$zsh_path" | sudo tee -a /etc/shells > /dev/null
 
-    chsh -s "$zsh_path" \
-        && success "Default shell set to ZSH. Re-login to apply." \
+    # Use `sudo chsh` (root changing the user's shell) so it never prompts for a
+    # password — works non-interactively and drops a prompt from recovery.
+    sudo chsh -s "$zsh_path" "$USER" \
+        && success "Default shell set to ZSH for $USER. Re-login to apply." \
         || warn "Could not set ZSH as default shell — change it later: chsh -s $zsh_path"
 }
 
@@ -1039,6 +1047,19 @@ install_hyprland() {
     systemctl --user enable --now wireplumber.service 2>/dev/null \
         && success "wireplumber.service enabled." \
         || warn "wireplumber.service: already active or needs a reboot to start."
+
+    # ── Display manager ───────────────────────────────────────────────────────
+    # Enable SDDM so the machine boots to a graphical login (→ Hyprland) instead
+    # of a bare TTY. A minimal install ships no enabled DM, so without this a
+    # recovered machine would come up text-only. Guarded on sddm being installed.
+    if pkg_installed sddm; then
+        service_enabled sddm.service \
+            || sudo systemctl enable sddm.service \
+            && log "SDDM enabled — graphical login on next boot." \
+            || warn "Could not enable SDDM — enable it manually: systemctl enable sddm"
+    else
+        warn "sddm not installed — no display manager enabled (boot will be text-only)."
+    fi
 }
 
 
