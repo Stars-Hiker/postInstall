@@ -367,40 +367,49 @@ install_from_pkglists() {
 
     local native="$DOTFILES_DIR/pkglists/pkgs-native.txt"
     local aur="$DOTFILES_DIR/pkglists/pkgs-aur.txt"
-
-    # Failures from BOTH lists accumulate here so we can report them once at the
-    # end. A package that was renamed or dropped from the repos (a routine event
-    # on rolling Arch) must NOT abort the whole recovery — we install everything
-    # that still resolves, then tell the user exactly what to look at by hand.
     local -a failed=()
 
-    # install_pkg_list <installer-cmd...> -- reads package names (one per line,
-    # '#' comments and blanks ignored) from stdin and installs them one at a
-    # time, appending any that fail to the shared `failed` array.
-    install_pkg_list() {
-        local pkg
-        while IFS= read -r pkg; do
-            pkg="${pkg%%#*}"; pkg="${pkg// /}"   # strip comments + whitespace
-            [[ -n "$pkg" ]] || continue
-            if ! "$@" --needed --noconfirm "$pkg" >/dev/null 2>&1; then
-                warn "  ✗ failed: $pkg"
-                failed+=("$pkg")
-            fi
+    # CRITICAL: read the lists into memory BEFORE installing anything. The
+    # pkglist-snapshot pacman hook rewrites these very files on every transaction
+    # during this run, so iterating the files directly races with the rewrite —
+    # the loop reads a truncated file and stops early, leaving most packages
+    # uninstalled (and no failure trace, since the list got overwritten).
+    # Snapshotting the names up front makes us immune to that.
+    local -a native_pkgs=() aur_pkgs=()
+    [[ -f "$native" ]] && mapfile -t native_pkgs < <(sed 's/#.*//' "$native" | tr -d '[:blank:]' | grep -v '^$')
+    [[ -f "$aur"    ]] && mapfile -t aur_pkgs    < <(sed 's/#.*//' "$aur"    | tr -d '[:blank:]' | grep -v '^$')
+
+    # install_batch <installer...> : install the `batch` array in ONE transaction
+    # (fast; fires the snapshot hook just once); if that fails (e.g. a renamed or
+    # dropped package aborts the whole transaction), retry per-package to isolate
+    # the offenders into `failed` so recovery still installs everything that
+    # resolves. </dev/null prevents the installer from consuming our stdin.
+    local -a batch
+    install_batch() {
+        [[ ${#batch[@]} -gt 0 ]] || return 0
+        if "$@" --needed --noconfirm "${batch[@]}" </dev/null; then
+            return 0
+        fi
+        warn "Batch install failed — retrying per-package to isolate bad packages..."
+        local p
+        for p in "${batch[@]}"; do
+            "$@" --needed --noconfirm "$p" </dev/null >/dev/null 2>&1 \
+                || { warn "  ✗ failed: $p"; failed+=("$p"); }
         done
     }
 
-    if file_exists "$native"; then
-        log "Installing native (repo) packages one by one from $native ..."
-        install_pkg_list sudo pacman -S < "$native"
+    if [[ ${#native_pkgs[@]} -gt 0 ]]; then
+        log "Installing ${#native_pkgs[@]} native (repo) packages..."
+        batch=("${native_pkgs[@]}"); install_batch sudo pacman -S
         success "Native package pass complete."
     else
         warn "No native package list at $native — skipping."
     fi
 
-    if file_exists "$aur"; then
+    if [[ ${#aur_pkgs[@]} -gt 0 ]]; then
         if cmd_exists paru; then
-            log "Installing AUR/foreign packages one by one from $aur ..."
-            install_pkg_list paru -S < "$aur"
+            log "Installing ${#aur_pkgs[@]} AUR/foreign packages..."
+            batch=("${aur_pkgs[@]}"); install_batch paru -S
             success "AUR package pass complete."
         else
             warn "paru not found — skipping AUR list: $aur"
