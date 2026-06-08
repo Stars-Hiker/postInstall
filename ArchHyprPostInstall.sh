@@ -20,17 +20,28 @@ readonly DOTFILES_DIR="$HOME/.dotfiles"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}.log"
 readonly AUR_DIR="$HOME/AUR"
 
-# Reflector: country used for mirror selection and the reflector timer unit.
-readonly REFLECTOR_COUNTRY="France"
+# ── Tunables: defaults below; override with flags or the wizard (see --help) ──
+# Reflector country for mirror selection / the reflector timer unit.
+REFLECTOR_COUNTRY="France"
 
-# Set to "laptop" or "desktop".
-#   laptop  → installs TLP for battery management, disables tuned
-#   desktop → uses tuned with the "balanced" profile, skips TLP
-readonly MACHINE_TYPE="laptop"
+# "laptop" → TLP for battery management (disables tuned)
+# "desktop" → tuned with the "balanced" profile (skips TLP)
+MACHINE_TYPE="laptop"
 
-# Set to 1 if your root filesystem is Btrfs and you want automatic snapshots.
-# The script auto-detects this, but you can force-disable it by setting to 0.
-readonly ENABLE_SNAPPER="auto"
+# "auto" → snapshots only if root is Btrfs · "1" → force on · "0" → off
+ENABLE_SNAPPER="auto"
+
+# Source subnet allowed through the firewall (your LAN). The wizard auto-detects
+# a sensible default; override with --lan.
+LAN_SUBNET="192.168.0.0/24"
+
+# ── Runtime flags (set by parse_args / the wizard) ───────────────────────────
+DRY_RUN=0          # --dry-run  : print the plan, change nothing, no sudo
+ASSUME_YES=0       # --yes      : skip the confirmation prompt
+RUN_WIZARD=1       # --no-wizard: disable the interactive setup wizard
+STEP_NUM=0         # current step index (for the [N/TOTAL] progress prefix)
+STEP_TOTAL=0       # total steps (set once the STEPS list is built)
+declare -A SET_BY_FLAG=()   # which tunables a flag set, so the wizard skips them
 
 # ==============================================================================
 # COLOURS & LOGGING
@@ -56,8 +67,10 @@ error_exit() {
 }
 
 section() {
+    local label="$1"
+    [[ "$STEP_TOTAL" -gt 0 ]] && label="[${STEP_NUM}/${STEP_TOTAL}] $1"
     echo -e "\n${BLUE}============================================${RESET}" | tee -a "$LOG_FILE"
-    echo -e "${BLUE}  $1${RESET}" | tee -a "$LOG_FILE"
+    echo -e "${BLUE}  ${label}${RESET}" | tee -a "$LOG_FILE"
     echo -e "${BLUE}============================================${RESET}" | tee -a "$LOG_FILE"
 }
 # NOTE: Plain = characters instead of Unicode box-drawing (==) so the log
@@ -403,6 +416,23 @@ install_from_pkglists() {
 # Requires the PRIVATE age identity at ~/.config/age/keys.txt, which is NEVER in
 # git — restore it from Bitwarden/USB first. If absent, warn and continue so the
 # rest of the bootstrap still completes.
+# After secrets (SSH keys) are restored, switch the dotfiles remote from HTTPS to
+# SSH so `dotsync` can push without a GitHub credential or `gh` login.
+switch_dotfiles_remote_ssh() {
+    dir_exists "$DOTFILES_DIR/.git" || return 0
+    local url; url=$(git -C "$DOTFILES_DIR" remote get-url origin 2>/dev/null) || return 0
+    case "$url" in
+        https://github.com/*)
+            local path="${url#https://github.com/}"; path="${path%.git}"
+            if git -C "$DOTFILES_DIR" remote set-url origin "git@github.com:${path}.git"; then
+                log "dotfiles remote switched to SSH (push needs no gh login)."
+            else
+                warn "Could not switch dotfiles remote to SSH — do it manually if needed."
+            fi
+            ;;
+    esac
+}
+
 restore_secrets() {
     section "Restoring encrypted secrets"
 
@@ -414,11 +444,34 @@ restore_secrets() {
         return 0
     fi
 
+    # The age key is the one step people forget — and the only thing that makes
+    # recovery actually work. If it's missing and we're interactive, offer to
+    # paste it right now instead of bailing out with a reminder.
+    if ! file_exists "$identity" && [[ -t 0 ]]; then
+        log "No age identity at $identity yet."
+        local key=""
+        read -rsp "Paste your AGE-SECRET-KEY line now (or Enter to skip): " key || true
+        echo
+        if [[ -n "$key" ]]; then
+            if [[ "$key" == AGE-SECRET-KEY-* ]]; then
+                mkdir -p "$HOME/.config/age" && chmod 700 "$HOME/.config/age"
+                printf '%s\n' "$key" > "$identity" && chmod 600 "$identity"
+                success "Age identity saved to $identity."
+            else
+                warn "That doesn't look like an AGE-SECRET-KEY — nothing saved."
+            fi
+        fi
+        unset key
+    fi
+
     if file_exists "$identity"; then
         log "Age identity found — decrypting secrets..."
-        bash "$unseal" \
-            || warn "secrets-unseal.sh failed — restore your secrets manually."
-        success "Secrets restored."
+        if bash "$unseal"; then
+            success "Secrets restored."
+            switch_dotfiles_remote_ssh
+        else
+            warn "secrets-unseal.sh failed — restore your secrets manually."
+        fi
     else
         warn "No age identity at $identity — secrets NOT restored."
         warn "  Copy your age key from Bitwarden/USB to $identity, then run:"
@@ -583,8 +636,8 @@ setup_firewall() {
     sudo ufw allow ssh
     sudo ufw allow Deluge
 
-    # Allow all traffic from your LAN. Adjust the subnet if yours differs.
-    sudo ufw allow from 192.168.0.0/24 comment "LAN"
+    # Allow all traffic from your LAN (set via --lan or the wizard).
+    sudo ufw allow from "$LAN_SUBNET" comment "LAN"
 
     # Rate-limit SSH: max 6 new connections per 30s per source IP.
     sudo ufw limit ssh comment "SSH rate-limit"
@@ -1027,12 +1080,183 @@ print_summary() {
 }
 
 # ==============================================================================
+# CLI ARGS, WIZARD & RUN CONTROL
+# ==============================================================================
+
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION} — Arch/CachyOS + Hyprland post-install bootstrapper
+
+Usage: ./ArchHyprPostInstall.sh [options]
+
+Options:
+  --laptop | --desktop     Machine type (default: ${MACHINE_TYPE}).
+                           laptop = TLP, desktop = tuned.
+  --country <name>         Reflector mirror country (default: ${REFLECTOR_COUNTRY}).
+  --lan <cidr>            LAN subnet allowed by the firewall
+                           (default: ${LAN_SUBNET}; the wizard auto-detects one).
+  --snapper <auto|on|off>  Btrfs snapshots (default: auto = on only if root is Btrfs).
+  -n, --dry-run            Print the resolved config + ordered steps, then exit.
+                           Changes nothing and needs no sudo.
+  -y, --yes                Skip the confirmation prompt (unattended runs).
+  --no-wizard              Skip the interactive wizard; use flags/defaults.
+  -h, --help               Show this help and exit.
+
+With no flags on a terminal, a short wizard asks for the machine type, mirror
+country, and LAN subnet, then previews the plan before changing anything.
+EOF
+}
+
+# CLI usage errors: concise message + pointer to --help, exit 2 (no run log).
+arg_error() {
+    echo -e "${RED}error:${RESET} $1" >&2
+    echo    "Run './ArchHyprPostInstall.sh --help' for usage." >&2
+    exit 2
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --laptop)  MACHINE_TYPE="laptop";  SET_BY_FLAG[machine]=1 ;;
+            --desktop) MACHINE_TYPE="desktop"; SET_BY_FLAG[machine]=1 ;;
+            --country) shift; [[ $# -gt 0 ]] || arg_error "--country needs a value."
+                       REFLECTOR_COUNTRY="$1"; SET_BY_FLAG[country]=1 ;;
+            --lan)     shift; [[ $# -gt 0 ]] || arg_error "--lan needs a value."
+                       LAN_SUBNET="$1"; SET_BY_FLAG[lan]=1 ;;
+            --snapper) shift; [[ $# -gt 0 ]] || arg_error "--snapper needs a value."
+                       case "$1" in
+                           auto) ENABLE_SNAPPER="auto" ;;
+                           on)   ENABLE_SNAPPER="1" ;;
+                           off)  ENABLE_SNAPPER="0" ;;
+                           *)    arg_error "--snapper must be auto|on|off." ;;
+                       esac ;;
+            -n|--dry-run) DRY_RUN=1 ;;
+            -y|--yes)     ASSUME_YES=1 ;;
+            --no-wizard)  RUN_WIZARD=0 ;;
+            -h|--help)    usage; exit 0 ;;
+            *) arg_error "Unknown option: $1" ;;
+        esac
+        shift
+    done
+}
+
+# Best-effort default LAN: the /24 of the default-route interface.
+detect_lan_subnet() {
+    local iface addr ipaddr
+    iface=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}') || true
+    [[ -n "$iface" ]] || return 1
+    addr=$(ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{print $4; exit}') || true
+    [[ "$addr" == */* ]] || return 1
+    ipaddr="${addr%/*}"
+    printf '%s.0/24\n' "${ipaddr%.*}"
+}
+
+# Interactive setup: only fills tunables not already pinned by a flag, and only
+# when attached to a terminal (so unattended runs keep flags/defaults).
+run_wizard() {
+    [[ "$RUN_WIZARD" -eq 1 ]] || return 0
+    [[ -t 0 ]] || return 0
+
+    section "Setup wizard (press Enter to accept the [default])"
+    local ans
+
+    if [[ -z "${SET_BY_FLAG[machine]:-}" ]]; then
+        read -r -p "Machine type — laptop/desktop [${MACHINE_TYPE}]: " ans || true
+        case "${ans,,}" in
+            laptop|desktop) MACHINE_TYPE="${ans,,}" ;;
+            "") : ;;
+            *)  warn "Unrecognised '${ans}' — keeping ${MACHINE_TYPE}." ;;
+        esac
+    fi
+
+    if [[ -z "${SET_BY_FLAG[country]:-}" ]]; then
+        read -r -p "Mirror country [${REFLECTOR_COUNTRY}]: " ans || true
+        [[ -n "$ans" ]] && REFLECTOR_COUNTRY="$ans"
+    fi
+
+    if [[ -z "${SET_BY_FLAG[lan]:-}" ]]; then
+        local guess; guess=$(detect_lan_subnet) || guess="$LAN_SUBNET"
+        read -r -p "LAN subnet allowed by the firewall [${guess}]: " ans || true
+        LAN_SUBNET="${ans:-$guess}"
+    fi
+}
+
+# One-screen preview of the resolved config and the ordered steps.
+print_plan() {
+    local snap_desc
+    case "$ENABLE_SNAPPER" in
+        0)    snap_desc="off" ;;
+        auto) snap_desc="auto (Btrfs only)" ;;
+        *)    snap_desc="on" ;;
+    esac
+    echo -e "\n${BLUE}================ planned run ================${RESET}"
+    echo -e "  Machine type  : ${MACHINE_TYPE}"
+    echo -e "  Mirror country: ${REFLECTOR_COUNTRY}"
+    echo -e "  LAN subnet    : ${LAN_SUBNET}"
+    echo -e "  Snapshots     : ${snap_desc}"
+    echo -e "  Dotfiles      : ${DOTFILES_REPO} -> ${DOTFILES_DIR}"
+    echo -e "  Log file      : ${LOG_FILE}"
+    echo -e "  Steps (${#STEPS[@]}):"
+    local i=1 entry
+    for entry in "${STEPS[@]}"; do
+        printf "    %2d. %s\n" "$i" "${entry#*|}"
+        i=$((i + 1))
+    done
+    echo ""
+}
+
+confirm_run() {
+    [[ "$ASSUME_YES" -eq 1 ]] && return 0
+    [[ -t 0 ]] || return 0
+    local ans
+    read -r -p "Proceed with this plan? [Y/n]: " ans || true
+    case "${ans,,}" in
+        n|no) error_exit "Aborted by user." ;;
+    esac
+}
+
+# ==============================================================================
 # MAIN — execution order
 # ==============================================================================
 
-# Truncate / create the log file for this run.
-: > "$LOG_FILE"
+parse_args "$@"
+run_wizard          # interactive: fill anything not set by a flag
 
+# Ordered steps as "function|Label" — the single source of truth for the run
+# loop, the [N/TOTAL] progress counter, and the --dry-run plan preview.
+# (Mirror setup is intentionally omitted: CachyOS ships its own ranked mirrorlist.)
+STEPS=(
+    "configure_pacman|Harden pacman.conf (multilib, parallel downloads)"
+    "setup_pacman_hooks|Install pacman hooks (orphans + pkglist snapshot)"
+    "install_paru|Install paru (AUR helper)"
+    "install_essentials|Install bootstrap packages"
+    "install_fonts|Install fonts"
+    "deploy_dotfiles|Clone + stow dotfiles (source of truth)"
+    "install_from_pkglists|Install the full package set from pkglists/"
+    "restore_secrets|Restore encrypted secrets (SSH keys)"
+    "configure_qemu_kvm|Configure QEMU/KVM (services, groups, network)"
+    "install_zsh_plugins|Install zsh plugins into ~/AUR"
+    "set_default_shell_zsh|Set zsh as the default shell"
+    "setup_firewall|Configure the UFW firewall"
+    "harden_ssh|Harden the SSH daemon"
+    "install_power_management|Power management (laptop=TLP / desktop=tuned)"
+    "setup_snapper|Btrfs snapshots via snapper (no-op if not Btrfs)"
+    "install_hyprland|Install Hyprland + the Wayland ecosystem"
+    "setup_user_dirs|Create user directories (~/ScreenShots)"
+)
+STEP_TOTAL=${#STEPS[@]}
+
+print_plan
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo -e "${YELLOW}Dry run — nothing was changed.${RESET}"
+    exit 0
+fi
+
+confirm_run
+
+# Past this point we actually change the system — start the run log now.
+: > "$LOG_FILE"
 log "Starting ${SCRIPT_NAME} v${SCRIPT_VERSION} — $(date)"
 log "Log: $LOG_FILE"
 
@@ -1042,53 +1266,10 @@ check_sudo_access
 check_internet
 check_dependencies
 
-# Pacman config first — all subsequent installs benefit from ParallelDownloads
-# and the multilib repo being available.
-configure_pacman        # Color, ParallelDownloads, VerbosePkgLists, multilib
-setup_pacman_hooks      # incl. the pkglist-snapshot hook (keeps lists fresh)
-
-# Mirrors: intentionally disabled. CachyOS ships its own ranked mirrorlist, so
-# running reflector here is redundant. Uncomment on a plain Arch install.
-#setup_mirrors
-#setup_mirror_timer
-
-# AUR helper (needed before install_from_pkglists for the AUR list).
-# paru.conf now ships from the dotfiles 'paru' stow package (deployed by
-# deploy_dotfiles below), so it is no longer generated here.
-install_paru
-
-# Bootstrap: minimal toolchain to fetch the dotfiles repo + decrypt secrets.
-install_essentials
-install_fonts           # moved early — no ordering dep, slow to download
-
-# Bring the source of truth onto the machine, THEN install everything from it.
-deploy_dotfiles         # clone dotfiles repo + stow configs (runs install.sh)
-install_from_pkglists   # install the FULL package set from pkglists/*
-restore_secrets         # decrypt ~/.ssh etc. (if age key is present)
-
-# Virtualisation: packages came from the list above; this only does
-# service/group/network setup.
-configure_qemu_kvm
-
-# Shell: the zsh config itself comes from the stowed dotfiles zsh/.zshrc; this
-# only clones the plugins it sources (into ~/AUR) and sets zsh as the default.
-install_zsh_plugins
-set_default_shell_zsh
-
-# Security
-setup_firewall
-harden_ssh
-
-# Power
-install_power_management   # laptop → TLP (masks tuned); desktop → tuned
-
-# Snapshots (no-op if root is not Btrfs)
-setup_snapper              # auto pre/post-pacman Btrfs snapshots via snap-pac
-
-# Hyprland + ecosysteme Wayland
-install_hyprland
-
-# User directories (screenshot target referenced by HYPRSHOT_DIR in .zshrc)
-setup_user_dirs
+# Run each step in order; section() shows the [N/TOTAL] progress prefix.
+for entry in "${STEPS[@]}"; do
+    STEP_NUM=$((STEP_NUM + 1))
+    "${entry%%|*}"
+done
 
 print_summary
