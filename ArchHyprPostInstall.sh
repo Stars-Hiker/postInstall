@@ -8,7 +8,6 @@ set -euo pipefail
 # set -u  : treat unset variables as errors (prevents silent $var typos)
 # set -o pipefail : a pipe fails if ANY command in it fails, not just the last
 
-
 # ==============================================================================
 # CONFIGURATION
 # Edit this section to personalise the script before running.
@@ -32,7 +31,6 @@ readonly MACHINE_TYPE="laptop"
 # Set to 1 if your root filesystem is Btrfs and you want automatic snapshots.
 # The script auto-detects this, but you can force-disable it by setting to 0.
 readonly ENABLE_SNAPPER="auto"
-
 
 # ==============================================================================
 # COLOURS & LOGGING
@@ -65,7 +63,6 @@ section() {
 # NOTE: Plain = characters instead of Unicode box-drawing (==) so the log
 # file renders correctly regardless of terminal locale / encoding.
 
-
 # ==============================================================================
 # IDEMPOTENCY HELPERS
 # Every step must be safe to re-run on an already-configured system.
@@ -84,7 +81,6 @@ pkg_installed() {
 service_enabled() {
     systemctl is-enabled --quiet "$1" 2>/dev/null
 }
-
 
 # ==============================================================================
 # PRE-FLIGHT CHECKS
@@ -122,7 +118,6 @@ check_dependencies() {
     [[ ${#missing[@]} -gt 0 ]] && error_exit "Missing required tools: ${missing[*]}"
     success "All pre-flight dependencies found."
 }
-
 
 # ==============================================================================
 # PACMAN CONFIGURATION
@@ -201,7 +196,6 @@ EOF
     success "pacman hooks installed."
 }
 
-
 # ==============================================================================
 # MIRRORS
 # ==============================================================================
@@ -273,7 +267,6 @@ EOF
     success "reflector.timer enabled."
 }
 
-
 # ==============================================================================
 # AUR HELPER — paru
 # ==============================================================================
@@ -304,33 +297,6 @@ install_paru() {
     )
     success "paru installed."
 }
-
-configure_paru() {
-    section "Configuring paru"
-
-    local conf="$HOME/.config/paru/paru.conf"
-    mkdir -p "$(dirname "$conf")"
-
-    if file_exists "$conf"; then
-        log "paru.conf already exists — skipping."
-        return 0
-    fi
-
-    cat > "$conf" <<'EOF'
-[options]
-# Show AUR results below official packages in search output
-BottomUp
-# Keep sudo alive during long AUR builds
-SudoLoop
-# Upgrade official + AUR packages in a single paru -Syu
-CombinedUpgrade
-# Remove build dirs after install to reclaim disk space
-CleanAfter
-EOF
-
-    success "paru.conf written to $conf"
-}
-
 
 # ==============================================================================
 # PACKAGE INSTALLATION
@@ -460,77 +426,6 @@ restore_secrets() {
     fi
 }
 
-install_custom_tools() {
-    section "Installing custom tools"
-
-    local pkgs=(
-        # System monitoring / info
-        btop fastfetch
-
-        # Browser
-        firefox
-
-        # Archives
-        unzip zip xz p7zip
-
-        # Wayland clipboard
-        wl-clipboard
-
-        # Modern CLI replacements
-        eza yazi bat fd ripgrep fzf zoxide lazygit
-
-        # Media
-        mpv imv
-
-        # Neovim ecosystem
-        tree-sitter-cli luarocks
-
-        # Compilers & debuggers
-        gcc gdb
-
-        # Network / security tools
-        nmap
-        wireshark-qt
-        aircrack-ng
-        nikto
-        john
-        hashcat
-        gobuster
-        sqlmap
-        proxychains-ng
-        whois
-        inetutils
-        openbsd-netcat
-        tcpdump
-        traceroute
-
-        # BitTorrent
-        deluge-gtk
-
-        # Disk management
-        gparted
-        xorg-xhost
-    )
-
-    sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
-        || error_exit "Failed to install custom tools."
-
-    # AUR-only tools — requires paru installed first.
-    local aur_pkgs=(
-        netdiscover     # ARP-based network scanner (removed from official repos)
-        thefuck         # command correction (AUR only)
-    )
-
-    if cmd_exists paru; then
-        paru -S --needed --noconfirm "${aur_pkgs[@]}" \
-            || warn "Some AUR tools failed to install: ${aur_pkgs[*]} — skipping."
-    else
-        warn "paru not found — skipping AUR tools: ${aur_pkgs[*]}"
-    fi
-
-    success "Custom tools installed."
-}
-
 configure_qemu_kvm() {
     section "Configuring QEMU/KVM virtualisation stack"
 
@@ -580,7 +475,6 @@ configure_qemu_kvm() {
     success "QEMU/KVM stack installed."
 }
 
-
 # ==============================================================================
 # ZSH
 # ==============================================================================
@@ -617,68 +511,6 @@ install_zsh_plugins() {
     success "ZSH plugins step done."
 }
 
-configure_zsh() {
-    section "Configuring .zshrc"
-
-    local zshrc="$HOME/.zshrc"
-    # Use a hard-coded marker string to keep the heredoc as <<'EOF' (no
-    # variable expansion inside the block, eliminating backslash-escape bugs).
-    local marker="# managed by ${SCRIPT_NAME}"
-
-    if grep -q "$marker" "$zshrc" 2>/dev/null; then
-        log ".zshrc already contains the managed block — skipping."
-        return 0
-    fi
-
-    # Write the marker line before the heredoc so the block itself is <<'EOF'.
-    echo "$marker" >> "$zshrc"
-
-    cat >> "$zshrc" <<'ZSHEOF'
-
-# ── Wayland environment ───────────────────────────────────────────────────────
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
-
-# ── Aliases ───────────────────────────────────────────────────────────────────
-alias ll='eza -la --icons --git'          # eza-enhanced listing
-alias lt='eza --tree --icons --level=2'   # directory tree (2 levels deep)
-alias cat='bat --paging=never'            # bat instead of plain cat
-alias grep='grep --color=auto'
-alias pac='sudo pacman -S --needed'
-alias update='sudo pacman -Syu'
-alias szsh='source ~/.zshrc'
-alias nzsh='nvim ~/.zshrc'
-
-# ── Auto ls after cd ──────────────────────────────────────────────────────────
-cd() { builtin cd "$@" && eza -la --icons --git; }
-
-# ── History ───────────────────────────────────────────────────────────────────
-HISTFILE=~/.zsh_history
-HISTSIZE=10000
-SAVEHIST=10000
-setopt HIST_IGNORE_DUPS     # don't record consecutive duplicate commands
-setopt HIST_IGNORE_SPACE    # commands prefixed with a space are not recorded
-setopt SHARE_HISTORY        # share history across all open ZSH sessions in real time
-
-# ── Key bindings (history substring search) ───────────────────────────────────
-bindkey '^[[A' history-substring-search-up    # Up arrow
-bindkey '^[[B' history-substring-search-down  # Down arrow
-
-# ── Plugins ───────────────────────────────────────────────────────────────────
-[[ -f "${HOME}/AUR/zsh-autosuggestions/zsh-autosuggestions.zsh" ]] \
-    && source "${HOME}/AUR/zsh-autosuggestions/zsh-autosuggestions.zsh"
-
-[[ -f "${HOME}/AUR/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh" ]] \
-    && source "${HOME}/AUR/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
-
-[[ -f "${HOME}/AUR/zsh-history-substring-search/zsh-history-substring-search.zsh" ]] \
-    && source "${HOME}/AUR/zsh-history-substring-search/zsh-history-substring-search.zsh"
-ZSHEOF
-
-    log ".zshrc updated. Run 'source ~/.zshrc' after switching to ZSH."
-    success ".zshrc configured."
-}
-
 set_default_shell_zsh() {
     section "Setting ZSH as default shell"
 
@@ -702,7 +534,6 @@ set_default_shell_zsh() {
         || warn "Could not set ZSH as default shell — change it later: chsh -s $zsh_path"
 }
 
-
 # ==============================================================================
 # FONTS
 # Installed early — no ordering dependency and they're slow to download.
@@ -724,7 +555,6 @@ install_fonts() {
     fc-cache -fv &>/dev/null
     success "Fonts installed and cache rebuilt."
 }
-
 
 # ==============================================================================
 # FIREWALL (UFW)
@@ -750,8 +580,8 @@ setup_firewall() {
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
     sudo ufw default deny forward
-		sudo ufw allow ssh
-		sudo ufw allow Deluge
+    sudo ufw allow ssh
+    sudo ufw allow Deluge
 
     # Allow all traffic from your LAN. Adjust the subnet if yours differs.
     sudo ufw allow from 192.168.0.0/24 comment "LAN"
@@ -817,7 +647,6 @@ EOF
 
     success "SSH hardening config written to $cfg"
 }
-
 
 # ==============================================================================
 # POWER MANAGEMENT
@@ -886,7 +715,6 @@ install_power_management() {
     fi
 }
 
-
 # ==============================================================================
 # BTRFS SNAPSHOTS (snapper)
 # Only runs if the root filesystem is Btrfs (or ENABLE_SNAPPER is forced on).
@@ -936,12 +764,11 @@ setup_snapper() {
     success "Snapper configured. Automatic snapshots active."
 }
 
-
 # ==============================================================================
 # HYPRLAND — compositeur Wayland + ecosysteme complet
 # Tous les paquets passent par paru (gere official + AUR en une commande).
-# firefox, yazi, wl-clipboard et ttf-jetbrains-mono-nerd sont deja installes
-# dans install_custom_tools / install_fonts — exclus ici pour eviter les doublons.
+# firefox, yazi, wl-clipboard et ttf-jetbrains-mono-nerd arrivent deja via les
+# pkglists et install_fonts — exclus ici pour eviter les doublons.
 # ==============================================================================
 
 install_hyprland() {
@@ -1053,102 +880,17 @@ install_hyprland() {
     # of a bare TTY. A minimal install ships no enabled DM, so without this a
     # recovered machine would come up text-only. Guarded on sddm being installed.
     if pkg_installed sddm; then
-        service_enabled sddm.service \
-            || sudo systemctl enable sddm.service \
-            && log "SDDM enabled — graphical login on next boot." \
-            || warn "Could not enable SDDM — enable it manually: systemctl enable sddm"
+        if service_enabled sddm.service; then
+            log "SDDM already enabled — graphical login on next boot."
+        elif sudo systemctl enable sddm.service; then
+            log "SDDM enabled — graphical login on next boot."
+        else
+            warn "Could not enable SDDM — enable it manually: systemctl enable sddm"
+        fi
     else
         warn "sddm not installed — no display manager enabled (boot will be text-only)."
     fi
 }
-
-
-# ==============================================================================
-# NEOVIM
-# ==============================================================================
-
-configure_neovim() {
-    section "Configuring Neovim"
-
-    local nvim_dir="$HOME/.config/nvim"
-    local nvim_file="$nvim_dir/init.lua"
-
-    mkdir -p "$nvim_dir"
-
-    if file_exists "$nvim_file"; then
-        log "init.lua already exists — skipping."
-        return 0
-    fi
-
-    cat > "$nvim_file" <<'EOF'
--- ===========================================================================
--- Neovim base configuration — generated by postInstall
--- ===========================================================================
-
--- ── Editor behaviour ─────────────────────────────────────────────────────────
-vim.opt.number         = true       -- absolute line numbers
--- vim.opt.relativenumber = true    -- uncomment for relative line numbers
-vim.opt.cursorline     = true       -- highlight the line the cursor is on
-vim.opt.scrolloff      = 8          -- keep 8 lines of context above/below cursor
-vim.opt.signcolumn     = "yes"      -- always show sign column (git signs, LSP)
-vim.opt.wrap           = false      -- don't soft-wrap long lines
-vim.opt.clipboard			 = "unnamedplus"
-
--- ── Indentation ──────────────────────────────────────────────────────────────
-vim.opt.expandtab      = true       -- insert spaces instead of a tab character
-vim.opt.shiftwidth     = 4
-vim.opt.tabstop        = 4
-vim.opt.softtabstop    = 4
-vim.opt.smartindent    = true
-
--- ── Search ───────────────────────────────────────────────────────────────────
-vim.opt.ignorecase     = true       -- case-insensitive by default
-vim.opt.smartcase      = true       -- case-sensitive if the query has uppercase
-vim.opt.hlsearch       = false      -- don't leave highlights after a search
-
--- ── Appearance ───────────────────────────────────────────────────────────────
-vim.opt.termguicolors  = true       -- 24-bit colour (required by most themes)
-
--- ── Clipboard ────────────────────────────────────────────────────────────────
--- Syncs Neovim's clipboard with the OS clipboard.
--- Requires wl-clipboard (Wayland) — installed by install_custom_tools().
-vim.opt.clipboard      = "unnamedplus"
-
--- ── Splits ───────────────────────────────────────────────────────────────────
-vim.opt.splitright     = true       -- :vsplit opens to the right
-vim.opt.splitbelow     = true       -- :split opens below
-
--- ── Leader key ───────────────────────────────────────────────────────────────
-vim.g.mapleader        = " "        -- Space as the leader key
-
--- ── Key mappings ─────────────────────────────────────────────────────────────
-
--- Clear search highlights
-vim.keymap.set("n", "<leader>/", "<cmd>nohlsearch<CR>", { desc = "Clear search highlights" })
-
--- Move selected lines up/down in visual mode and re-indent
-vim.keymap.set("v", "J", ":m '>+1<CR>gv=gv", { desc = "Move selection down" })
-vim.keymap.set("v", "K", ":m '<-2<CR>gv=gv", { desc = "Move selection up" })
-
--- Keep the cursor centred when scrolling with Ctrl-d / Ctrl-u
-vim.keymap.set("n", "<C-d>", "<C-d>zz", { desc = "Scroll down (centred)" })
-vim.keymap.set("n", "<C-u>", "<C-u>zz", { desc = "Scroll up (centred)" })
-
--- Save with Ctrl-s (normal and insert mode)
-vim.keymap.set("n", "<C-s>", "<cmd>w<CR>",      { desc = "Save file" })
-vim.keymap.set("i", "<C-s>", "<Esc><cmd>w<CR>", { desc = "Save file" })
-
--- ── Next steps ───────────────────────────────────────────────────────────────
--- This is a minimal base config intentionally — no plugin manager is bundled.
--- To add plugins, install lazy.nvim:
---   https://github.com/folke/lazy.nvim
--- Recommended starter plugins: telescope, nvim-treesitter, nvim-lspconfig,
--- conform.nvim (formatter), catppuccin or tokyonight (theme).
-EOF
-
-    success "Neovim init.lua written to $nvim_file"
-}
-
 
 # ==============================================================================
 # DOTFILES — déploiement via GitHub + GNU Stow
@@ -1233,10 +975,21 @@ deploy_dotfiles() {
         success "Dotfiles deployed via stow."
     else
         warn "install.sh not found in $DOTFILES_DIR — stow not run."
-        warn "Run manually: cd $DOTFILES_DIR && stow zsh hypr rofi waybar kitty"
+        warn "Run manually: cd $DOTFILES_DIR && ./install.sh"
     fi
 }
 
+# ==============================================================================
+# USER DIRECTORIES
+# ==============================================================================
+
+setup_user_dirs() {
+    section "Creating user directories"
+    # hyprshot saves screenshots here (HYPRSHOT_DIR in the dotfiles .zshrc); make
+    # it up front so the first capture on a fresh machine doesn't fail.
+    mkdir -p "$HOME/ScreenShots"
+    success "User directories ready."
+}
 
 # ==============================================================================
 # SUMMARY REPORT
@@ -1254,12 +1007,12 @@ print_summary() {
     echo -e "  ${YELLOW}Action required after reboot:${RESET}"
     echo -e "  1. Reboot — required for group membership (libvirt, kvm) and ZSH shell."
     echo -e "  2. Open virt-manager — VMs should work without sudo."
-		echo -e "     Start Hyprland, then install the hyprexpo plugin "
+    echo -e "     (Optional) In Hyprland, enable the hyprexpo plugin:"
+    echo -e "       ${BLUE}hyprpm add https://github.com/hyprwm/hyprland-plugins && hyprpm enable hyprexpo${RESET}"
     echo -e "  3. Run ${BLUE}ufw status verbose${RESET} to review firewall rules."
     echo -e "  4. Once SSH keys are set up, edit ${BLUE}/etc/ssh/sshd_config.d/99-hardening.conf${RESET}"
     echo -e "     and set ${BLUE}PasswordAuthentication no${RESET}."
-    echo -e "  5. Run ${BLUE}nvim${RESET} to verify the config; see init.lua comments to"
-    echo -e "     add lazy.nvim and plugins."
+    echo -e "  5. Run ${BLUE}nvim${RESET} to verify your editor config (deployed from dotfiles)."
     echo ""
     echo -e "  Useful commands:"
     echo -e "    paru -Syu          — upgrade official + AUR packages"
@@ -1268,11 +1021,10 @@ print_summary() {
     echo -e "    snapper list       — list Btrfs snapshots (if Btrfs)"
     echo -e "    tuned-adm profile  — show active tuned profile (desktop)"
     echo -e "    tlp-stat           — show TLP battery status (laptop)"
-    echo -e "    cd ~/.dotfiles && git pull && stow --restow hypr zsh rofi waybar kitty"
+    echo -e "    cd ~/.dotfiles && git pull && ./install.sh"
     echo -e "                       — mettre a jour les dotfiles"
     echo ""
 }
-
 
 # ==============================================================================
 # MAIN — execution order
@@ -1295,13 +1047,15 @@ check_dependencies
 configure_pacman        # Color, ParallelDownloads, VerbosePkgLists, multilib
 setup_pacman_hooks      # incl. the pkglist-snapshot hook (keeps lists fresh)
 
-# Mirrors
+# Mirrors: intentionally disabled. CachyOS ships its own ranked mirrorlist, so
+# running reflector here is redundant. Uncomment on a plain Arch install.
 #setup_mirrors
 #setup_mirror_timer
 
-# AUR helper (needed before install_from_pkglists for the AUR list)
+# AUR helper (needed before install_from_pkglists for the AUR list).
+# paru.conf now ships from the dotfiles 'paru' stow package (deployed by
+# deploy_dotfiles below), so it is no longer generated here.
 install_paru
-configure_paru
 
 # Bootstrap: minimal toolchain to fetch the dotfiles repo + decrypt secrets.
 install_essentials
@@ -1312,17 +1066,13 @@ deploy_dotfiles         # clone dotfiles repo + stow configs (runs install.sh)
 install_from_pkglists   # install the FULL package set from pkglists/*
 restore_secrets         # decrypt ~/.ssh etc. (if age key is present)
 
-# NOTE: install_custom_tools is intentionally NOT called — its curated package
-# list is now captured in dotfiles/pkglists/ and installed above. The function
-# is kept defined for reference only.
-
 # Virtualisation: packages came from the list above; this only does
 # service/group/network setup.
 configure_qemu_kvm
 
-# Shell
+# Shell: the zsh config itself comes from the stowed dotfiles zsh/.zshrc; this
+# only clones the plugins it sources (into ~/AUR) and sets zsh as the default.
 install_zsh_plugins
-configure_zsh
 set_default_shell_zsh
 
 # Security
@@ -1335,10 +1085,10 @@ install_power_management   # laptop → TLP (masks tuned); desktop → tuned
 # Snapshots (no-op if root is not Btrfs)
 setup_snapper              # auto pre/post-pacman Btrfs snapshots via snap-pac
 
-# Editor
-#configure_neovim
-
 # Hyprland + ecosysteme Wayland
 install_hyprland
+
+# User directories (screenshot target referenced by HYPRSHOT_DIR in .zshrc)
+setup_user_dirs
 
 print_summary
