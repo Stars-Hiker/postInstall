@@ -42,7 +42,7 @@ warning is replayed in the final summary so nothing scrolls away unseen.
 | Flag | Effect |
 |------|--------|
 | `--laptop` / `--desktop` | Machine type (default `laptop`): TLP vs tuned. |
-| `--country <name>` | Reflector mirror country (default `France`). Ignored on CachyOS, which ships its own ranked mirrorlist. |
+| `--country <name>` | Reflector mirror country (default `France`). Ignored on CachyOS, where mirrors are ranked with `cachyos-rate-mirrors` instead. |
 | `--lan <cidr>` | LAN subnet allowed by the firewall (wizard auto-detects one). |
 | `--snapper <auto\|on\|off>` | Btrfs snapshots (default `auto` = on only if root is Btrfs). |
 | `--from <step>` | Start at the given step (name or number — see `--list-steps`). |

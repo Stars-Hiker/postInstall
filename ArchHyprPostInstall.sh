@@ -14,7 +14,7 @@ set -euo pipefail
 # ==============================================================================
 
 readonly SCRIPT_NAME="postInstall"
-readonly SCRIPT_VERSION="7"
+readonly SCRIPT_VERSION="8"
 readonly DOTFILES_REPO="https://github.com/Stars-Hiker/dotfiles"
 readonly DOTFILES_DIR="$HOME/.dotfiles"
 # In $HOME (not /tmp) so the log survives the post-install reboot, with a
@@ -245,9 +245,22 @@ EOF
 setup_mirrors() {
     section "Configuring pacman mirrors"
 
-    # Vanilla Arch only — see is_cachyos().
+    # On CachyOS, rank with ITS tool, not reflector (which only knows Arch
+    # mirrors and would fight the cachyos-mirrorlist setup). Re-ranking matters
+    # in recovery: the default archlinux.cachyos.org mirror has been seen
+    # resetting HTTP/2 streams on large packages (rocsparse/comgr, ~1 GB),
+    # and cachyos-rate-mirrors rewrites both the CachyOS AND Arch mirrorlists
+    # with healthy, fast mirrors before the big pkglist download pass.
     if is_cachyos; then
-        log "CachyOS detected — keeping its ranked mirrorlist; skipping reflector."
+        if ! pkg_installed cachyos-rate-mirrors; then
+            sudo pacman -S --needed --noconfirm cachyos-rate-mirrors \
+                || { warn "Could not install cachyos-rate-mirrors — keeping current mirrors."; return 0; }
+        fi
+        log "CachyOS detected — ranking mirrors with cachyos-rate-mirrors..."
+        sudo cachyos-rate-mirrors \
+            || { warn "cachyos-rate-mirrors failed — keeping the current mirrorlists."; return 0; }
+        sudo pacman -Syy || warn "pacman DB refresh failed — continuing."
+        success "CachyOS mirrors re-ranked."
         return 0
     fi
 
@@ -1073,7 +1086,8 @@ Options:
   --laptop | --desktop     Machine type (default: ${MACHINE_TYPE}).
                            laptop = TLP, desktop = tuned.
   --country <name>         Reflector mirror country (default: ${REFLECTOR_COUNTRY}).
-                           Ignored on CachyOS (ships its own ranked mirrorlist).
+                           Ignored on CachyOS, where mirrors are ranked with
+                           cachyos-rate-mirrors instead of reflector.
   --lan <cidr>            LAN subnet allowed by the firewall
                            (default: ${LAN_SUBNET}; the wizard auto-detects one).
   --snapper <auto|on|off>  Btrfs snapshots (default: auto = on only if root is Btrfs).
@@ -1237,7 +1251,7 @@ print_plan() {
         *)    snap_desc="on" ;;
     esac
     local country_desc="$REFLECTOR_COUNTRY"
-    is_cachyos && country_desc="n/a (CachyOS ranked mirrors — reflector skipped)"
+    is_cachyos && country_desc="n/a (CachyOS — ranked with cachyos-rate-mirrors)"
     echo -e "\n${BLUE}================ planned run ================${RESET}"
     echo -e "  Machine type  : ${MACHINE_TYPE}"
     echo -e "  Mirror country: ${country_desc}"
@@ -1276,7 +1290,7 @@ parse_args "$@"
 # ships its own ranked mirrorlist) and run on vanilla Arch.
 STEPS=(
     "configure_pacman|Harden pacman.conf + full system upgrade"
-    "setup_mirrors|Rank pacman mirrors with reflector (skipped on CachyOS)"
+    "setup_mirrors|Rank pacman mirrors (reflector / cachyos-rate-mirrors)"
     "setup_mirror_timer|Weekly reflector refresh timer (skipped on CachyOS)"
     "setup_pacman_hooks|Install pacman hooks (orphans + pkglist snapshot)"
     "install_paru|Install paru (AUR helper)"
