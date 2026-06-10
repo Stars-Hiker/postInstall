@@ -15,11 +15,45 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: bash -n (parse check)
-        run: bash -n ArchHyprPostInstall.sh
+        run: |
+          bash -n ArchHyprPostInstall.sh
+          bash -n boot.sh
 
       # This is a large, intentionally un-pedantic script. bash -n above already
       # catches syntax errors; here we gate only on shellcheck *error*-level
       # findings (real breakage), not the many style/info/warning suggestions.
       # SC1090/SC1091: dynamic source paths. SC2155: declare-and-assign style.
       - name: shellcheck
-        run: shellcheck --severity=error -e SC1090,SC1091,SC2155 ArchHyprPostInstall.sh
+        run: shellcheck --severity=error -e SC1090,SC1091,SC2155 ArchHyprPostInstall.sh boot.sh
+
+  smoke:
+    name: Dry-run smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --dry-run touches no pacman/sudo and the wizard self-skips without a
+      # tty, so the full arg-parsing → step-filter → plan-preview path runs
+      # fine on ubuntu. This catches runtime breakage that bash -n can't
+      # (bad expansions under set -u, broken step tables, etc.).
+      - name: dry-run prints the plan and exits cleanly
+        run: |
+          out=$(./ArchHyprPostInstall.sh --dry-run --no-wizard)
+          echo "$out"
+          grep -q "planned run" <<<"$out"
+          grep -q "Dry run — nothing was changed." <<<"$out"
+
+      - name: list-steps prints the step table
+        run: ./ArchHyprPostInstall.sh --list-steps | grep -q "configure_pacman"
+
+      - name: step filters resolve names and numbers
+        run: |
+          ./ArchHyprPostInstall.sh --dry-run --only setup_firewall | grep -q "UFW"
+          ./ArchHyprPostInstall.sh --dry-run --from 5 --skip setup_snapper > /dev/null
+
+      - name: usage errors exit 2
+        run: |
+          set +e
+          ./ArchHyprPostInstall.sh --definitely-not-a-flag; [ $? -eq 2 ] || exit 1
+          ./ArchHyprPostInstall.sh --dry-run --only no_such_step; [ $? -eq 2 ] || exit 1
+          exit 0

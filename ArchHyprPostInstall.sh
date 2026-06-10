@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# Arch Linux Post-Installation Script — v3
+# Arch Linux Post-Installation Script (version: see SCRIPT_VERSION below)
 # Run as a regular user with sudo privileges, NOT as root.
 # ==============================================================================
 set -euo pipefail
@@ -14,10 +14,12 @@ set -euo pipefail
 # ==============================================================================
 
 readonly SCRIPT_NAME="postInstall"
-readonly SCRIPT_VERSION="5"
+readonly SCRIPT_VERSION="6"
 readonly DOTFILES_REPO="https://github.com/Stars-Hiker/dotfiles"
 readonly DOTFILES_DIR="$HOME/.dotfiles"
-readonly LOG_FILE="/tmp/${SCRIPT_NAME}.log"
+# In $HOME (not /tmp) so the log survives the post-install reboot, with a
+# timestamp so re-runs don't clobber the previous run's log.
+readonly LOG_FILE="$HOME/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 readonly AUR_DIR="$HOME/AUR"
 
 # ── Tunables: defaults below; override with flags or the wizard (see --help) ──
@@ -39,13 +41,21 @@ LAN_SUBNET="192.168.0.0/24"
 DRY_RUN=0          # --dry-run  : print the plan, change nothing, no sudo
 ASSUME_YES=0       # --yes      : skip the confirmation prompt
 RUN_WIZARD=1       # --no-wizard: disable the interactive setup wizard
+LIST_STEPS=0       # --list-steps: print the numbered step list and exit
+FROM_STEP=""       # --from     : start at this step (name or number)
+ONLY_STEP=""       # --only     : run just this step
+SKIP_STEPS=()      # --skip     : steps to skip (repeatable)
 STEP_NUM=0         # current step index (for the [N/TOTAL] progress prefix)
 STEP_TOTAL=0       # total steps (set once the STEPS list is built)
+CURRENT_STEP_LABEL=""       # label of the running step (for the ERR trap)
 declare -A SET_BY_FLAG=()   # which tunables a flag set, so the wizard skips them
+declare -a WARNINGS=()      # every warn() message, replayed in print_summary
 
 # ==============================================================================
 # COLOURS & LOGGING
-# All output goes to the terminal AND to $LOG_FILE for post-run review.
+# Once the run is confirmed, main redirects ALL output (script messages AND
+# pacman/paru/makepkg output) through tee into $LOG_FILE — see the exec line.
+# The helpers below are therefore plain echos.
 # ==============================================================================
 
 readonly BLUE="\e[1;34m"
@@ -54,24 +64,23 @@ readonly YELLOW="\e[1;33m"
 readonly RED="\e[1;31m"
 readonly RESET="\e[0m"
 
-log()     { echo -e "${BLUE}   >> $1${RESET}"   | tee -a "$LOG_FILE"; }
-success() { echo -e "${GREEN}   OK $1${RESET}"  | tee -a "$LOG_FILE"; }
-warn()    { echo -e "${YELLOW} WARN $1${RESET}" | tee -a "$LOG_FILE"; }
+log()     { echo -e "${BLUE}   >> $1${RESET}"; }
+success() { echo -e "${GREEN}   OK $1${RESET}"; }
+warn()    { echo -e "${YELLOW} WARN $1${RESET}"; WARNINGS+=("$1"); }
 
 error_exit() {
-    # Pipe to tee first, THEN redirect combined output to stderr.
-    # (echo ... >&2 | tee) does NOT work — >&2 fires before tee sees anything.)
-    echo -e "${RED}  ERR $1${RESET}" | tee -a "$LOG_FILE" >&2
-    echo -e "${RED}  See $LOG_FILE for the full run log.${RESET}" >&2
+    echo -e "${RED}  ERR $1${RESET}" >&2
+    # Only point at the log once it actually exists (logging starts post-confirm).
+    [[ -f "$LOG_FILE" ]] && echo -e "${RED}  See $LOG_FILE for the full run log.${RESET}" >&2
     exit 1
 }
 
 section() {
     local label="$1"
     [[ "$STEP_TOTAL" -gt 0 ]] && label="[${STEP_NUM}/${STEP_TOTAL}] $1"
-    echo -e "\n${BLUE}============================================${RESET}" | tee -a "$LOG_FILE"
-    echo -e "${BLUE}  ${label}${RESET}" | tee -a "$LOG_FILE"
-    echo -e "${BLUE}============================================${RESET}" | tee -a "$LOG_FILE"
+    echo -e "\n${BLUE}============================================${RESET}"
+    echo -e "${BLUE}  ${label}${RESET}"
+    echo -e "${BLUE}============================================${RESET}"
 }
 # NOTE: Plain = characters instead of Unicode box-drawing (==) so the log
 # file renders correctly regardless of terminal locale / encoding.
@@ -95,6 +104,15 @@ service_enabled() {
     systemctl is-enabled --quiet "$1" 2>/dev/null
 }
 
+is_cachyos() {
+    # CachyOS ships its own ranked mirrorlist (and cachyos-rate-mirrors), so
+    # mirror management belongs to it — reflector would fight that. NOTE: it
+    # reports ID=arch in /etc/os-release (verified), so detect it by its
+    # mirrorlist file / repo sections instead.
+    [[ -f /etc/pacman.d/cachyos-mirrorlist ]] \
+        || grep -q '^\[cachyos' /etc/pacman.conf 2>/dev/null
+}
+
 # ==============================================================================
 # PRE-FLIGHT CHECKS
 # ==============================================================================
@@ -108,7 +126,9 @@ check_sudo_access() {
     # Cache credentials upfront so no password prompt fires mid-run.
     sudo -v || error_exit "sudo access is required but could not be obtained."
     # Keep the sudo timestamp alive for the duration of the script.
-    ( while true; do sudo -n true; sleep 50; done ) &
+    # `|| true`: the subshell inherits set -e, so one transient sudo failure
+    # would otherwise kill the keepalive silently → password prompt mid-run.
+    ( while true; do sudo -n true 2>/dev/null || true; sleep 50; done ) &
     SUDO_KEEPALIVE_PID=$!
     # Kill the keepalive on exit (success or failure).
     trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null' EXIT
@@ -131,6 +151,8 @@ check_dependencies() {
     [[ ${#missing[@]} -gt 0 ]] && error_exit "Missing required tools: ${missing[*]}"
     success "All pre-flight dependencies found."
 }
+# NOTE: check_internet uses curl, so check_dependencies must run before it
+# (main enforces this order).
 
 # ==============================================================================
 # PACMAN CONFIGURATION
@@ -161,8 +183,11 @@ configure_pacman() {
         warn "[multilib] section not found in pacman.conf — skipping."
     fi
 
-    sudo pacman -Syy
-    success "pacman.conf configured."
+    # The ONE full sync+upgrade of the run, done early: every later install uses
+    # plain -S, and installing into a stale system risks the classic Arch
+    # partial-upgrade breakage (real on re-runs months after install).
+    sudo pacman -Syu --noconfirm || error_exit "Full system upgrade failed."
+    success "pacman.conf configured and system upgraded."
 }
 
 setup_pacman_hooks() {
@@ -186,11 +211,15 @@ Exec = /bin/bash -c 'orphans=$(pacman -Qdtq 2>/dev/null); [ -n "$orphans" ] && e
 EOF
 
     # Auto-refresh the dotfiles package lists after every transaction so
-    # pkglists/pkgs-{native,aur}.txt always reflect reality. The generator runs
-    # as root (hooks always do) and chowns the files back to the repo owner.
-    # The [ -d ] guard makes it a no-op on a machine where the dotfiles repo
+    # pkglists/pkgs-{native,aur}.txt always reflect reality. Hooks run as root,
+    # but the snapshot script is USER-WRITABLE — executing it as root would let
+    # anything that compromises the user account escalate to root on the next
+    # pacman transaction. runuser drops to the repo owner: pacman -Q needs no
+    # root, and the files come out owned by the user (no chown hack needed).
+    # The [ -x ] guard makes it a no-op on a machine where the dotfiles repo
     # isn't cloned yet (e.g. mid-bootstrap). Absolute path is required: hooks
-    # have no $HOME and no working directory guarantees.
+    # have no HOME and no working-directory guarantees.
+    # (runuser is in util-linux — always present on Arch.)
     local snapshot="${DOTFILES_DIR}/bin/pkg-snapshot.sh"
     sudo tee /etc/pacman.d/hooks/95-pkglist-snapshot.hook > /dev/null <<EOF
 [Trigger]
@@ -203,7 +232,7 @@ Target = *
 [Action]
 Description = Snapshotting explicit package lists to dotfiles...
 When = PostTransaction
-Exec = /bin/bash -c '[ -x "${snapshot}" ] && "${snapshot}" || true'
+Exec = /bin/bash -c '[ -x "${snapshot}" ] && /usr/bin/runuser -u ${USER} -- "${snapshot}" || true'
 EOF
 
     success "pacman hooks installed."
@@ -216,10 +245,15 @@ EOF
 setup_mirrors() {
     section "Configuring pacman mirrors"
 
+    # Vanilla Arch only — see is_cachyos().
+    if is_cachyos; then
+        log "CachyOS detected — keeping its ranked mirrorlist; skipping reflector."
+        return 0
+    fi
+
     if ! pkg_installed reflector; then
-        # This is the one and only full system upgrade in the script.
-        # All subsequent installs use -S (no repeated -Syu).
-        sudo pacman -Syu --needed --noconfirm reflector \
+        # DBs are fresh: configure_pacman already did the full -Syu.
+        sudo pacman -S --needed --noconfirm reflector \
             || error_exit "Failed to install reflector."
     fi
 
@@ -245,6 +279,11 @@ setup_mirrors() {
 
 setup_mirror_timer() {
     section "Setting up reflector systemd timer"
+
+    if is_cachyos; then
+        log "CachyOS detected — no reflector timer needed; skipping."
+        return 0
+    fi
 
     # sudo tee avoids nested heredoc quoting issues with sudo bash -c.
     sudo tee /etc/systemd/system/reflector.service > /dev/null <<EOF
@@ -299,15 +338,15 @@ install_paru() {
 
     mkdir -p "$AUR_DIR"
 
-    local paru_dir="${AUR_DIR}/paru"
-    (
-        if ! dir_exists "$paru_dir"; then
-            git clone https://aur.archlinux.org/paru.git "$paru_dir" \
-                || error_exit "Failed to clone paru."
-        fi
-        cd "$paru_dir"
-        makepkg -si --noconfirm || error_exit "makepkg failed for paru."
-    )
+    # paru-bin repackages the prebuilt release binary — same paru, but skips
+    # compiling it (and pulling the whole Rust toolchain) on a fresh machine.
+    local paru_dir="${AUR_DIR}/paru-bin"
+    if ! dir_exists "$paru_dir"; then
+        git clone https://aur.archlinux.org/paru-bin.git "$paru_dir" \
+            || error_exit "Failed to clone paru-bin."
+    fi
+    ( cd "$paru_dir" && makepkg -si --noconfirm ) \
+        || error_exit "makepkg failed for paru-bin."
     success "paru installed."
 }
 
@@ -522,7 +561,7 @@ configure_qemu_kvm() {
     fi
 
     log "KVM host validation:"
-    sudo virt-host-validate qemu 2>&1 | tee -a "$LOG_FILE" \
+    sudo virt-host-validate qemu \
         || warn "Some KVM checks failed — review $LOG_FILE."
 
     success "QEMU/KVM stack installed."
@@ -588,28 +627,6 @@ set_default_shell_zsh() {
 }
 
 # ==============================================================================
-# FONTS
-# Installed early — no ordering dependency and they're slow to download.
-# ==============================================================================
-
-install_fonts() {
-    section "Installing fonts"
-    local pkgs=(
-        noto-fonts
-        noto-fonts-emoji        # Emoji rendering — missing by default on Arch
-        otf-monaspace-nerd
-        ttf-jetbrains-mono-nerd
-        otf-font-awesome
-    )
-    sudo pacman -S --needed --noconfirm "${pkgs[@]}" \
-        || { warn "Some fonts failed to install — continuing (icons/emoji may be missing)."; return 0; }
-
-    # Rebuild font cache so new fonts are usable immediately without a reboot.
-    fc-cache -fv &>/dev/null
-    success "Fonts installed and cache rebuilt."
-}
-
-# ==============================================================================
 # FIREWALL (UFW)
 # ==============================================================================
 
@@ -633,18 +650,17 @@ setup_firewall() {
     sudo ufw default deny incoming
     sudo ufw default allow outgoing
     sudo ufw default deny forward
-    sudo ufw allow ssh
+
+    # Deluge BitTorrent — the "Deluge" application profile ships with the ufw
+    # package itself (/etc/ufw/applications.d/ufw-bittorent).
     sudo ufw allow Deluge
 
     # Allow all traffic from your LAN (set via --lan or the wizard).
     sudo ufw allow from "$LAN_SUBNET" comment "LAN"
 
     # Rate-limit SSH: max 6 new connections per 30s per source IP.
+    # (limit implies allow — no separate `ufw allow ssh` needed.)
     sudo ufw limit ssh comment "SSH rate-limit"
-
-    # Deluge BitTorrent — no built-in UFW profile exists on Arch.
-    #sudo ufw allow 6881/tcp comment "Deluge TCP"
-    #sudo ufw allow 6881/udp comment "Deluge UDP"
 
     # libvirt/KVM virtual networking. With "deny incoming" + "deny forward",
     # ufw otherwise drops guest DHCP requests to dnsmasq (no IP lease) and the
@@ -664,7 +680,7 @@ setup_firewall() {
         || warn "Could not enable the UFW service — continuing."
 
     sudo ufw --force enable || warn "Could not activate UFW — continuing (firewall may be inactive)."
-    sudo ufw status verbose | tee -a "$LOG_FILE"
+    sudo ufw status verbose
     success "Firewall step done."
 }
 
@@ -818,106 +834,23 @@ setup_snapper() {
 }
 
 # ==============================================================================
-# HYPRLAND — compositeur Wayland + ecosysteme complet
-# Tous les paquets passent par paru (gere official + AUR en une commande).
-# firefox, yazi, wl-clipboard et ttf-jetbrains-mono-nerd arrivent deja via les
-# pkglists et install_fonts — exclus ici pour eviter les doublons.
+# DESKTOP SESSION
+# Hyprland, Waybar, kitty, PipeWire, fonts, SDDM, … are all INSTALLED from the
+# dotfiles pkglists (single source of truth — see install_from_pkglists). This
+# step only configures what package lists can't capture: the font cache, the
+# PipeWire user services, and the display manager.
 # ==============================================================================
 
-install_hyprland() {
-    section "Installing Hyprland & Wayland ecosystem"
+configure_desktop() {
+    section "Configuring desktop session (font cache, PipeWire, SDDM)"
 
-    if ! cmd_exists paru; then
-        warn "paru not found — cannot install the Hyprland packages. Skipping."
-        warn "Install paru, then re-run, or: paru -S hyprland waybar rofi kitty ..."
-        return 0
+    # ── Font cache ────────────────────────────────────────────────────────────
+    # Rebuild so fonts from the pkglist pass are usable without a re-login.
+    if cmd_exists fc-cache; then
+        fc-cache -f >/dev/null \
+            && log "Font cache rebuilt." \
+            || warn "fc-cache failed — fonts may need a re-login to appear."
     fi
-
-    # ── Core — Hyprland et ecosysteme natif Hypr ─────────────────────────────
-    local pkgs_core=(
-        hyprland                    # Compositeur Wayland
-        hyprlock                    # Ecran de verrouillage
-        hypridle                    # Daemon inactivite (verrouillage + veille auto)
-        hyprsunset                  # Filtre lumiere bleue
-        hyprpolkitagent             # Agent Polkit natif (remplace polkit-kde)
-        hyprshot                    # Captures d ecran
-        xdg-desktop-portal-hyprland # Partage d ecran Wayland (OBS, Discord, Zoom)
-    )
-
-    # ── Interface ─────────────────────────────────────────────────────────────
-    local pkgs_ui=(
-        waybar                      # Barre de statut
-        rofi                        # Launcher (supporte Wayland)
-        papirus-icon-theme          # Icones pour rofi --show-icons
-        #wlogout                     # Menu deconnexion/extinction
-        swaync                      # Daemon notifications + panel
-    )
-
-    # ── Terminal & environnement ───────────────────────────────────────────────
-    local pkgs_env=(
-        kitty                       # Terminal principal
-        swww                        # Daemon wallpaper avec transitions
-        cliphist                    # Gestionnaire presse-papiers
-    )
-
-    # ── Audio — PipeWire ──────────────────────────────────────────────────────
-    # NOTE: pipewire, wireplumber et pipewire-pulse sont aussi installes par
-    # ArchWizard dans le chroot. paru --needed les ignore s ils sont deja presents.
-    local pkgs_audio=(
-        pipewire                    # Serveur audio moderne
-        wireplumber                 # Session manager (requis par wpctl)
-        pipewire-pulse              # Compatibilite PulseAudio
-    )
-
-    # ── Peripheriques ─────────────────────────────────────────────────────────
-    local pkgs_hw=(
-        brightnessctl               # Controle luminosite ecran
-        playerctl                   # Controle lecture media
-    )
-
-    # ── Optionnels recommandes ────────────────────────────────────────────────
-    local pkgs_optional=(
-        nwg-look                    # Reglage theme GTK sous Wayland
-        qt6ct                       # Reglage theme Qt6 sous Wayland
-        qt5-wayland                 # Support Wayland pour apps Qt5
-        qt6-wayland                 # Support Wayland pour apps Qt6
-        hyprcursor                  # Format curseur natif Hypr (HiDPI)
-        hyprpicker                  # Pipette couleur Wayland
-        wallust                     # Theming auto depuis le fond d ecran
-        grim                        # Backend screenshot (dep de hyprshot region)
-        slurp                       # Selection zone ecran (dep de hyprshot region)
-        libnotify                   # Fournit notify-send (utilise par hypridle)
-    )
-
-    # ── Installation groupee via paru ─────────────────────────────────────────
-    local all_pkgs=(
-        "${pkgs_core[@]}"
-        "${pkgs_ui[@]}"
-        "${pkgs_env[@]}"
-        "${pkgs_audio[@]}"
-        "${pkgs_hw[@]}"
-        "${pkgs_optional[@]}"
-    )
-
-    log "Installing ${#all_pkgs[@]} Hyprland packages via paru..."
-    paru -S --needed --noconfirm "${all_pkgs[@]}" \
-        || warn "Some Hyprland packages failed to install (see paru output above) — continuing."
-
-    success "Hyprland ecosystem step done."
-
-    # ── Plugin hyprexpo via hyprpm ────────────────────────────────────────────
-    # hyprpm est installe avec hyprland. Il gere les plugins officiels.
-    #if cmd_exists hyprpm; then
-    #    log "Installing hyprexpo plugin via hyprpm..."
-    #    hyprpm add https://github.com/hyprwm/hyprland-plugins 2>/dev/null || true
-    #    hyprpm enable hyprexpo 2>/dev/null \
-    #        && success "hyprexpo plugin enabled." \
-    #        || warn "hyprexpo could not be enabled — run 'hyprpm enable hyprexpo' after first Hyprland boot."
-    #else
-    #    warn "hyprpm not found — install hyprexpo manually after first Hyprland boot:"
-    #    warn "  hyprpm add https://github.com/hyprwm/hyprland-plugins"
-    #    warn "  hyprpm enable hyprexpo"
-    #fi
 
     # ── Services PipeWire ─────────────────────────────────────────────────────
     log "Enabling PipeWire user services..."
@@ -1057,6 +990,21 @@ print_summary() {
     echo -e "  Machine type: ${MACHINE_TYPE}"
     echo -e "  Dotfiles    : ${DOTFILES_DIR}"
     echo ""
+
+    # Replay every warning from the run — they scroll out of sight behind
+    # hundreds of lines of pacman/paru output, and on an unattended run this
+    # recap is the only practical way to see what needs manual follow-up.
+    if [[ ${#WARNINGS[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}${#WARNINGS[@]} warning(s) during this run:${RESET}"
+        local w
+        for w in "${WARNINGS[@]}"; do
+            echo -e "  ${YELLOW} WARN ${w}${RESET}"
+        done
+        echo ""
+    else
+        echo -e "  ${GREEN}No warnings — clean run.${RESET}"
+        echo ""
+    fi
     echo -e "  ${YELLOW}Action required after reboot:${RESET}"
     echo -e "  1. Reboot — required for group membership (libvirt, kvm) and ZSH shell."
     echo -e "  2. Open virt-manager — VMs should work without sudo."
@@ -1093,9 +1041,15 @@ Options:
   --laptop | --desktop     Machine type (default: ${MACHINE_TYPE}).
                            laptop = TLP, desktop = tuned.
   --country <name>         Reflector mirror country (default: ${REFLECTOR_COUNTRY}).
+                           Ignored on CachyOS (ships its own ranked mirrorlist).
   --lan <cidr>            LAN subnet allowed by the firewall
                            (default: ${LAN_SUBNET}; the wizard auto-detects one).
   --snapper <auto|on|off>  Btrfs snapshots (default: auto = on only if root is Btrfs).
+  --from <step>            Start at the given step; earlier steps are skipped.
+                           <step> is a function name or number — see --list-steps.
+  --only <step>            Run a single step, nothing else.
+  --skip <step>            Skip a step (repeatable).
+  --list-steps             Print the numbered step list and exit.
   -n, --dry-run            Print the resolved config + ordered steps, then exit.
                            Changes nothing and needs no sudo.
   -y, --yes                Skip the confirmation prompt (unattended runs).
@@ -1103,7 +1057,8 @@ Options:
   -h, --help               Show this help and exit.
 
 With no flags on a terminal, a short wizard asks for the machine type, mirror
-country, and LAN subnet, then previews the plan before changing anything.
+country (vanilla Arch only), and LAN subnet, then previews the plan before
+changing anything. Steps are idempotent, so --from/--only re-runs are safe.
 EOF
 }
 
@@ -1130,6 +1085,13 @@ parse_args() {
                            off)  ENABLE_SNAPPER="0" ;;
                            *)    arg_error "--snapper must be auto|on|off." ;;
                        esac ;;
+            --from)    shift; [[ $# -gt 0 ]] || arg_error "--from needs a value."
+                       ONLY_STEP="" FROM_STEP="$1" ;;
+            --only)    shift; [[ $# -gt 0 ]] || arg_error "--only needs a value."
+                       FROM_STEP="" ONLY_STEP="$1" ;;
+            --skip)    shift; [[ $# -gt 0 ]] || arg_error "--skip needs a value."
+                       SKIP_STEPS+=("$1") ;;
+            --list-steps) LIST_STEPS=1 ;;
             -n|--dry-run) DRY_RUN=1 ;;
             -y|--yes)     ASSUME_YES=1 ;;
             --no-wizard)  RUN_WIZARD=0 ;;
@@ -1169,7 +1131,8 @@ run_wizard() {
         esac
     fi
 
-    if [[ -z "${SET_BY_FLAG[country]:-}" ]]; then
+    # Mirror country only matters where reflector actually runs (vanilla Arch).
+    if [[ -z "${SET_BY_FLAG[country]:-}" ]] && ! is_cachyos; then
         read -r -p "Mirror country [${REFLECTOR_COUNTRY}]: " ans || true
         [[ -n "$ans" ]] && REFLECTOR_COUNTRY="$ans"
     fi
@@ -1181,6 +1144,58 @@ run_wizard() {
     fi
 }
 
+# Resolve a --from/--only/--skip value (function name or 1-based number from
+# --list-steps) to an index into the FULL step list; usage error if unknown.
+resolve_step() {
+    local want="$1" i
+    for i in "${!STEPS[@]}"; do
+        if [[ "$want" == "${STEPS[$i]%%|*}" || "$want" == "$((i + 1))" ]]; then
+            echo "$i"; return 0
+        fi
+    done
+    arg_error "Unknown step '$want' — see --list-steps for names and numbers."
+}
+
+print_step_list() {
+    local i
+    for i in "${!STEPS[@]}"; do
+        printf "%3d  %-26s %s\n" "$((i + 1))" "${STEPS[$i]%%|*}" "${STEPS[$i]#*|}"
+    done
+}
+
+# Narrow STEPS according to --from/--only/--skip. Numbers always refer to the
+# full list as shown by --list-steps; the [N/TOTAL] progress then re-counts
+# over what's left. Idempotent steps make any partial run safe.
+apply_step_filters() {
+    local -a kept=()
+    local i s idx from_idx=0
+
+    # Validate every --skip value up front (a typo should be a usage error,
+    # not a silently ignored filter).
+    for s in "${SKIP_STEPS[@]}"; do
+        resolve_step "$s" >/dev/null
+    done
+
+    if [[ -n "$ONLY_STEP" ]]; then
+        idx=$(resolve_step "$ONLY_STEP")
+        kept=("${STEPS[$idx]}")
+    else
+        [[ -n "$FROM_STEP" ]] && from_idx=$(resolve_step "$FROM_STEP")
+        for i in "${!STEPS[@]}"; do
+            (( i < from_idx )) && continue
+            local skip=0
+            for s in "${SKIP_STEPS[@]}"; do
+                [[ "$s" == "${STEPS[$i]%%|*}" || "$s" == "$((i + 1))" ]] && skip=1
+            done
+            (( skip )) && continue
+            kept+=("${STEPS[$i]}")
+        done
+    fi
+
+    [[ ${#kept[@]} -gt 0 ]] || arg_error "Step filters left nothing to run."
+    STEPS=("${kept[@]}")
+}
+
 # One-screen preview of the resolved config and the ordered steps.
 print_plan() {
     local snap_desc
@@ -1189,9 +1204,11 @@ print_plan() {
         auto) snap_desc="auto (Btrfs only)" ;;
         *)    snap_desc="on" ;;
     esac
+    local country_desc="$REFLECTOR_COUNTRY"
+    is_cachyos && country_desc="n/a (CachyOS ranked mirrors — reflector skipped)"
     echo -e "\n${BLUE}================ planned run ================${RESET}"
     echo -e "  Machine type  : ${MACHINE_TYPE}"
-    echo -e "  Mirror country: ${REFLECTOR_COUNTRY}"
+    echo -e "  Mirror country: ${country_desc}"
     echo -e "  LAN subnet    : ${LAN_SUBNET}"
     echo -e "  Snapshots     : ${snap_desc}"
     echo -e "  Dotfiles      : ${DOTFILES_REPO} -> ${DOTFILES_DIR}"
@@ -1220,17 +1237,18 @@ confirm_run() {
 # ==============================================================================
 
 parse_args "$@"
-run_wizard          # interactive: fill anything not set by a flag
 
 # Ordered steps as "function|Label" — the single source of truth for the run
-# loop, the [N/TOTAL] progress counter, and the --dry-run plan preview.
-# (Mirror setup is intentionally omitted: CachyOS ships its own ranked mirrorlist.)
+# loop, the [N/TOTAL] progress counter, the --dry-run plan preview, and the
+# --from/--only/--skip filters. The mirror steps self-skip on CachyOS (which
+# ships its own ranked mirrorlist) and run on vanilla Arch.
 STEPS=(
-    "configure_pacman|Harden pacman.conf (multilib, parallel downloads)"
+    "configure_pacman|Harden pacman.conf + full system upgrade"
+    "setup_mirrors|Rank pacman mirrors with reflector (skipped on CachyOS)"
+    "setup_mirror_timer|Weekly reflector refresh timer (skipped on CachyOS)"
     "setup_pacman_hooks|Install pacman hooks (orphans + pkglist snapshot)"
     "install_paru|Install paru (AUR helper)"
     "install_essentials|Install bootstrap packages"
-    "install_fonts|Install fonts"
     "deploy_dotfiles|Clone + stow dotfiles (source of truth)"
     "install_from_pkglists|Install the full package set from pkglists/"
     "restore_secrets|Restore encrypted secrets (SSH keys)"
@@ -1241,10 +1259,28 @@ STEPS=(
     "harden_ssh|Harden the SSH daemon"
     "install_power_management|Power management (laptop=TLP / desktop=tuned)"
     "setup_snapper|Btrfs snapshots via snapper (no-op if not Btrfs)"
-    "install_hyprland|Install Hyprland + the Wayland ecosystem"
+    "configure_desktop|Configure desktop session (font cache, PipeWire, SDDM)"
     "setup_user_dirs|Create user directories (~/ScreenShots)"
 )
+
+if [[ "$LIST_STEPS" -eq 1 ]]; then
+    print_step_list
+    exit 0
+fi
+
+apply_step_filters
 STEP_TOTAL=${#STEPS[@]}
+
+# Fail fast BEFORE the wizard: neither check needs sudo or network, and a root
+# user shouldn't have to answer every question just to be turned away.
+# Skipped for --dry-run, which must work anywhere (even a pacman-less CI box)
+# since it changes nothing.
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    check_not_root
+    check_dependencies
+fi
+
+run_wizard          # interactive: fill anything not set by a flag
 
 print_plan
 
@@ -1255,21 +1291,30 @@ fi
 
 confirm_run
 
-# Past this point we actually change the system — start the run log now.
-: > "$LOG_FILE"
+# Past this point we actually change the system. Log EVERYTHING from here on —
+# the script's own messages AND full pacman/paru/makepkg output — to $LOG_FILE
+# while still printing to the terminal.
+exec > >(tee -a "$LOG_FILE") 2>&1
 log "Starting ${SCRIPT_NAME} v${SCRIPT_VERSION} — $(date)"
 log "Log: $LOG_FILE"
 
-# Pre-flight
-check_not_root
+# Pre-flight needing sudo/network (check_dependencies already verified curl).
 check_sudo_access
 check_internet
-check_dependencies
+
+# Safety net for any unguarded command: the failing step's own stderr is right
+# above (and in the log); this names the step so the run never dies silently.
+# Deliberately NOT using `set -E` — inheriting the ERR trap into functions,
+# command substitutions, and process substitutions fires it on guarded,
+# expected failures. At the top level it only triggers when a step fails.
+trap 'error_exit "Step ${STEP_NUM}/${STEP_TOTAL} failed: ${CURRENT_STEP_LABEL}"' ERR
 
 # Run each step in order; section() shows the [N/TOTAL] progress prefix.
 for entry in "${STEPS[@]}"; do
     STEP_NUM=$((STEP_NUM + 1))
+    CURRENT_STEP_LABEL="${entry#*|}"
     "${entry%%|*}"
 done
+trap - ERR
 
 print_summary

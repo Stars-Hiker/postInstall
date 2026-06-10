@@ -13,6 +13,16 @@ sets up services, firewall, and Hyprland.
 
 ## TL;DR recovery
 
+One-liner (works even on a minimal install without git — installs it, clones
+this repo, hands off to the script with the wizard intact):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Stars-Hiker/postInstall/main/boot.sh | bash
+# pass flags through:  ... | bash -s -- --desktop --yes
+```
+
+Or manually:
+
 ```sh
 git clone https://github.com/Stars-Hiker/postInstall ~/postInstall
 cd ~/postInstall
@@ -23,24 +33,32 @@ sudo reboot
 ```
 
 Want to see what it would do first? `./ArchHyprPostInstall.sh --dry-run` prints
-the resolved config and the ordered steps and changes nothing.
+the resolved config and the ordered steps and changes nothing. The full run is
+logged to `~/postInstall-<timestamp>.log` (survives the reboot), and every
+warning is replayed in the final summary so nothing scrolls away unseen.
 
 ## Options
 
 | Flag | Effect |
 |------|--------|
 | `--laptop` / `--desktop` | Machine type (default `laptop`): TLP vs tuned. |
-| `--country <name>` | Reflector mirror country (default `France`). |
+| `--country <name>` | Reflector mirror country (default `France`). Ignored on CachyOS, which ships its own ranked mirrorlist. |
 | `--lan <cidr>` | LAN subnet allowed by the firewall (wizard auto-detects one). |
 | `--snapper <auto\|on\|off>` | Btrfs snapshots (default `auto` = on only if root is Btrfs). |
+| `--from <step>` | Start at the given step (name or number — see `--list-steps`). |
+| `--only <step>` | Run a single step, nothing else. |
+| `--skip <step>` | Skip a step (repeatable). |
+| `--list-steps` | Print the numbered step list and exit. |
 | `-n`, `--dry-run` | Print the resolved config + ordered steps, then exit. |
 | `-y`, `--yes` | Skip the confirmation prompt (unattended runs). |
 | `--no-wizard` | Skip the interactive wizard; use flags/defaults. |
 | `-h`, `--help` | Show usage. |
 
 With no flags on a terminal a short **wizard** asks for the machine type, mirror
-country, and LAN subnet, shows a **numbered plan**, and asks to confirm before
-touching the system. `--yes` (or a non-interactive shell) runs unattended.
+country (vanilla Arch only), and LAN subnet, shows a **numbered plan**, and asks
+to confirm before touching the system. `--yes` (or a non-interactive shell) runs
+unattended. Every step is idempotent, so re-runs — full or via `--from`/`--only`
+— are safe.
 
 ## Secrets (the age key)
 
