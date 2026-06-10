@@ -14,7 +14,7 @@ set -euo pipefail
 # ==============================================================================
 
 readonly SCRIPT_NAME="postInstall"
-readonly SCRIPT_VERSION="6"
+readonly SCRIPT_VERSION="7"
 readonly DOTFILES_REPO="https://github.com/Stars-Hiker/dotfiles"
 readonly DOTFILES_DIR="$HOME/.dotfiles"
 # In $HOME (not /tmp) so the log survives the post-install reboot, with a
@@ -326,9 +326,17 @@ EOF
 install_paru() {
     section "Installing paru (AUR helper)"
 
-    if cmd_exists paru; then
-        log "paru is already installed, skipping."
+    # FUNCTIONAL check, not cmd_exists: when a pacman upgrade bumps the libalpm
+    # soname, an existing paru binary still exists but dies on startup with
+    # "error while loading shared libraries: libalpm.so.N". Treat a paru that
+    # cannot run as not installed, so it gets rebuilt against the new libalpm.
+    if paru -V &>/dev/null; then
+        log "paru is installed and working, skipping."
         return 0
+    fi
+    if cmd_exists paru; then
+        warn "paru exists but cannot run (libalpm soname bump after a pacman"
+        warn "upgrade is the usual cause) — rebuilding it against the new libalpm..."
     fi
 
     # base-devel is a mandatory makepkg dependency.
@@ -338,15 +346,24 @@ install_paru() {
 
     mkdir -p "$AUR_DIR"
 
-    # paru-bin repackages the prebuilt release binary — same paru, but skips
-    # compiling it (and pulling the whole Rust toolchain) on a fresh machine.
-    local paru_dir="${AUR_DIR}/paru-bin"
+    # Built from SOURCE deliberately (not paru-bin): the prebuilt binary links
+    # a fixed libalpm soname and breaks whenever Arch/CachyOS bumps it before
+    # upstream rebuilds the release — and "rebuilding" paru-bin just downloads
+    # the same broken binary. Compiling here always links the libalpm installed
+    # right now. The rust dep is pulled by makepkg -s (it's in the pkglists
+    # anyway), costing a few minutes once per recovery — robustness wins.
+    local paru_dir="${AUR_DIR}/paru"
     if ! dir_exists "$paru_dir"; then
-        git clone https://aur.archlinux.org/paru-bin.git "$paru_dir" \
-            || error_exit "Failed to clone paru-bin."
+        git clone https://aur.archlinux.org/paru.git "$paru_dir" \
+            || error_exit "Failed to clone paru."
+    else
+        git -C "$paru_dir" pull --ff-only \
+            || warn "Could not refresh the paru PKGBUILD — building the existing checkout."
     fi
-    ( cd "$paru_dir" && makepkg -si --noconfirm ) \
-        || error_exit "makepkg failed for paru-bin."
+    # -f: force the rebuild even if a package of the same version was already
+    # built (the soname-break case rebuilds the same pkgver).
+    ( cd "$paru_dir" && makepkg -sif --noconfirm ) \
+        || error_exit "makepkg failed for paru."
     success "paru installed."
 }
 
@@ -415,9 +432,12 @@ install_from_pkglists() {
             return 0
         fi
         warn "Batch install failed — retrying per-package to isolate bad packages..."
+        # Retry output is NOT silenced: when a package fails here, the installer's
+        # error text is the only clue why (it lands in $LOG_FILE with everything
+        # else). Hiding it cost a debugging round-trip once — never again.
         local p
         for p in "${batch[@]}"; do
-            "$@" --needed --noconfirm "$p" </dev/null >/dev/null 2>&1 \
+            "$@" --needed --noconfirm "$p" </dev/null \
                 || { warn "  ✗ failed: $p"; failed+=("$p"); }
         done
     }
@@ -437,6 +457,12 @@ install_from_pkglists() {
     fi
 
     if [[ ${#aur_pkgs[@]} -gt 0 ]]; then
+        # The native pass above may have JUST upgraded pacman/libalpm, breaking
+        # the existing paru binary (soname bump — it exists but can't start).
+        # install_paru detects exactly that and rebuilds against the new libalpm.
+        if cmd_exists paru && ! paru -V &>/dev/null; then
+            install_paru
+        fi
         if cmd_exists paru; then
             log "Installing ${#aur_pkgs[@]} AUR/foreign packages..."
             batch=("${aur_pkgs[@]}"); install_batch paru -S
