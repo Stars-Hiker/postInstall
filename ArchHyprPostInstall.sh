@@ -424,7 +424,13 @@ install_from_pkglists() {
 
     if [[ ${#native_pkgs[@]} -gt 0 ]]; then
         log "Installing ${#native_pkgs[@]} native (repo) packages..."
-        batch=("${native_pkgs[@]}"); install_batch sudo pacman -S
+        # --ask=4 (ALPM_QUESTION_CONFLICT_PKG): auto-answer YES to "X and Y are
+        # in conflict. Remove Y?" — --noconfirm alone answers NO and aborts the
+        # whole transaction. Concretely: pipewire-jack vs jack2 — jack2 gets
+        # installed earlier as the default `jack` provider, then pipewire-jack
+        # (the one actually in the lists) can't install unattended without this.
+        # The lists are the source of truth, so the conflicting package yields.
+        batch=("${native_pkgs[@]}"); install_batch sudo pacman -S --ask=4
         success "Native package pass complete."
     else
         warn "No native package list at $native — skipping."
